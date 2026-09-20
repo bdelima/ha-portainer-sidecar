@@ -93,10 +93,11 @@ async def get_action_items() -> dict[str, Any]:
             state = await ha_get_state(entity_id)
         except httpx.HTTPStatusError as exc:
             raise HTTPException(status_code=502, detail=f"HA request failed for {entity_id}: {exc}") from exc
-        result[key] = {
-            "count": int(state.get("state", 0) or 0),
-            "items": state.get("attributes", {}).get("items", []),
-        }
+        raw_state = state.get("state", "0")
+        try:
+            count = int(raw_state)
+        except (TypeError, ValueError):
+            count = 0
     return result
 
 
