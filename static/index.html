@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portainer Action Dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Container Actions</h1>
+    <div class="header-right">
+      <span id="last-updated" class="muted"></span>
+      <button id="refresh-btn" class="icon-btn" title="Refresh now">⟳</button>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-tab="updates">Updates <span class="count" id="count-updates">0</span></button>
+    <button class="tab" data-tab="trouble">Trouble <span class="count" id="count-trouble">0</span></button>
+    <button class="tab" data-tab="stale">Stale <span class="count" id="count-stale">0</span></button>
+  </nav>
+
+  <main>
+    <div id="empty-state" class="empty-state" hidden>
+      <div class="empty-icon">✅</div>
+      <div>All clear — nothing needs attention.</div>
+    </div>
+
+    <section class="panel" data-panel="updates">
+      <table class="item-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" data-select-all="updates"></th>
+            <th>Container</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows-updates"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" data-panel="trouble" hidden>
+      <table class="item-table">
+        <thead>
+          <tr>
+            <th>Container</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows-trouble"></tbody>
+      </table>
+    </section>
+
+    <section class="panel" data-panel="stale" hidden>
+      <table class="item-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input type="checkbox" data-select-all="stale"></th>
+            <th>Device</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows-stale"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <div id="action-bar" class="action-bar" hidden>
+    <span id="selection-count"></span>
+    <div class="action-bar-buttons">
+      <button id="action-btn" class="primary-btn"></button>
+      <button id="clear-selection-btn" class="ghost-btn">Clear</button>
+    </div>
+  </div>
+</div>
+
+<div id="confirm-dialog" class="dialog-backdrop" hidden>
+  <div class="dialog">
+    <p id="confirm-text"></p>
+    <div class="dialog-buttons">
+      <button id="confirm-cancel" class="ghost-btn">Cancel</button>
+      <button id="confirm-ok" class="danger-btn">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>
