@@ -5,7 +5,7 @@ name: Release and publish Docker image
 # others once this one's proven out.
 #
 # Bump the VERSION file and push to main: this creates a matching GitHub
-# Release (same pattern as ha-portainer-maintenance's release workflow)
+# Release (same pattern as ha-portainer-dashboard's release workflow)
 # and, only once that succeeds, builds and pushes a multi-arch image to
 # Docker Hub tagged both with that version and `latest`. No separate
 # manual release or docker-push step, ever.
@@ -25,6 +25,7 @@ on:
     branches: [main]
     paths:
       - VERSION
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -85,5 +86,5 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            bdelima/portainer-action-dashboard:${{ needs.release.outputs.version }}
-            bdelima/portainer-action-dashboard:latest
+            bdelima/ha-portainer-sidecar:${{ needs.release.outputs.version }}
+            bdelima/ha-portainer-sidecar:latest

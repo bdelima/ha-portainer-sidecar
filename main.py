@@ -4,7 +4,7 @@ A small standalone web app giving a real, multi-select management UI for the
 action items tracked by the Home Assistant Portainer automation set
 (sensor.portainer_updates_pending, sensor.portainer_container_trouble,
 sensor.portainer_stale_devices). Pairs with the "Portainer Maintenance" HA
-custom integration (https://github.com/bdelima/ha-portainer-maintenance),
+custom integration (https://github.com/bdelima/ha-portainer-dashboard),
 which registers a sidebar panel pointing at this app and creates the three
 sensors it reads.
 
@@ -56,7 +56,7 @@ SENSORS = {
     "stale": "sensor.portainer_stale_devices",
 }
 
-app = FastAPI(title="Portainer Action Dashboard")
+app = FastAPI(title="Portainer Sidecar")
 
 
 async def ha_get_state(entity_id: str) -> dict[str, Any]:

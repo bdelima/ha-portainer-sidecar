@@ -1,6 +1,6 @@
-# Portainer Action Dashboard
+# Portainer Sidecar
 
-A small, self-hosted web app that gives a real multi-select management UI for the Portainer container updates, container trouble, and stale-device tracking exposed by the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-maintenance) Home Assistant integration — instead of the limits of a Lovelace dashboard.
+A small, self-hosted web app that gives a real multi-select management UI for the Portainer container updates, container trouble, and stale-device tracking exposed by the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) Home Assistant integration — instead of the limits of a Lovelace dashboard.
 
 It's a two-piece app: a small FastAPI backend that holds a Home Assistant long-lived access token server-side (never sent to the browser) and proxies a handful of endpoints, plus a static HTML/CSS/JS frontend served directly by that same backend. One container, no build step, no frontend framework.
 
@@ -8,10 +8,10 @@ It's a two-piece app: a small FastAPI backend that holds a Home Assistant long-l
 
 - Reads three Home Assistant sensors — `sensor.portainer_updates_pending`, `sensor.portainer_container_trouble`, `sensor.portainer_stale_devices` — via HA's REST API and renders them as three tabs (Updates / Trouble / Stale) with real checkboxes and a floating action bar.
 - **Install updates**: select one or more pending `update.*` entities, calls `script.portainer_perform_update` for each.
-- **Delete stale devices**: select one or more stale Portainer devices, calls `portainer_maintenance.remove_device` for each (a service provided by the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-maintenance) integration — HA has no built-in way to delete a device from an automation/script).
+- **Delete stale devices**: select one or more stale Portainer devices, calls `portainer_maintenance.remove_device` for each (a service provided by the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration — HA has no built-in way to delete a device from an automation/script).
 - Polls for updates every 15 seconds.
 
-This app doesn't create those sensors or that service itself — see the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-maintenance) integration, which this app is designed to pair with.
+This app doesn't create those sensors or that service itself — see the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration, which this app is designed to pair with.
 
 ## Configuration
 
@@ -25,7 +25,7 @@ Two required environment variables:
 ## Running it
 
 A prebuilt, multi-arch (amd64/arm64) image is published to Docker Hub as
-[`bdelima/portainer-action-dashboard`](https://hub.docker.com/r/bdelima/portainer-action-dashboard),
+[`bdelima/ha-portainer-sidecar`](https://hub.docker.com/r/bdelima/ha-portainer-sidecar),
 tagged both with each release version (see `VERSION`) and `latest` --
 built and pushed automatically by this repo's own GitHub Actions workflow
 on every version bump. Building from source (`build: .` / `docker build`)
@@ -38,9 +38,9 @@ Add a service like this to an existing stack (or create your own):
 
 ```yaml
 services:
-  portainer-action-dashboard:
-    image: bdelima/portainer-action-dashboard:latest
-    container_name: portainer-action-dashboard
+  ha-portainer-sidecar:
+    image: bdelima/ha-portainer-sidecar:latest
+    container_name: ha-portainer-sidecar
     restart: unless-stopped
     environment:
       HA_BASE_URL: "https://homeassistant.example.com"
@@ -60,18 +60,18 @@ docker run -d \
   -e HA_BASE_URL="https://homeassistant.example.com" \
   -e HA_TOKEN="your-long-lived-access-token" \
   -p 8000:8000 \
-  bdelima/portainer-action-dashboard:latest
+  bdelima/ha-portainer-sidecar:latest
 ```
 
 ### Building from source instead
 
 ```bash
-docker build -t portainer-action-dashboard .
+docker build -t ha-portainer-sidecar .
 docker run -d \
   -e HA_BASE_URL="https://homeassistant.example.com" \
   -e HA_TOKEN="your-long-lived-access-token" \
   -p 8000:8000 \
-  portainer-action-dashboard
+  ha-portainer-sidecar
 ```
 
 ## Versioning and publishing (maintainers)
@@ -95,7 +95,7 @@ not something a workflow file can do for itself):
 
 ## Embedding in Home Assistant
 
-The [Portainer Maintenance](https://github.com/bdelima/ha-portainer-maintenance) integration registers a sidebar panel pointing at this app's URL automatically as part of its own setup — no manual dashboard configuration needed. See that repo's README for the full installation flow.
+The [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration registers a sidebar panel pointing at this app's URL automatically as part of its own setup — no manual dashboard configuration needed. See that repo's README for the full installation flow.
 
 ## License
 
