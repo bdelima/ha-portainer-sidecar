@@ -112,7 +112,7 @@ async def install_updates(payload: InstallRequest) -> dict[str, Any]:
     errors = []
     for entity_id in payload.update_entities:
         try:
-            await ha_call_service("script", "portainer_perform_update", {"update_entity": entity_id})
+            await ha_call_service("portainer_maintenance", "perform_update", {"update_entity": entity_id})
         except httpx.HTTPStatusError as exc:
             errors.append({"entity": entity_id, "error": str(exc)})
     return {"attempted": len(payload.update_entities), "errors": errors}
