@@ -1,0 +1,89 @@
+name: Release and publish Docker image
+
+# Pilot for the "build once, version formally, publish to Docker Hub"
+# pattern for all the homelab images -- start here, replicate to the
+# others once this one's proven out.
+#
+# Bump the VERSION file and push to main: this creates a matching GitHub
+# Release (same pattern as ha-portainer-maintenance's release workflow)
+# and, only once that succeeds, builds and pushes a multi-arch image to
+# Docker Hub tagged both with that version and `latest`. No separate
+# manual release or docker-push step, ever.
+#
+# One-time setup this workflow depends on (can't be done from a workflow
+# file -- these live in Docker Hub's and GitHub's own settings):
+#   1. Docker Hub -> Account Settings -> Personal access tokens -> create
+#      one scoped to Read & Write for this repo.
+#   2. GitHub repo -> Settings -> Secrets and variables -> Actions ->
+#      New repository secret, twice:
+#        DOCKERHUB_USERNAME = your Docker Hub username
+#        DOCKERHUB_TOKEN    = the access token from step 1 (not your
+#                              Docker Hub password)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      created: ${{ steps.check.outputs.exists == 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Read version from VERSION file
+        id: version
+        run: echo "version=$(tr -d ' \n' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version was already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag and GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.version }}" \
+            --title "${{ steps.version.outputs.version }}" \
+            --generate-notes
+
+  docker:
+    needs: release
+    if: needs.release.outputs.created == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            bdelima/portainer-action-dashboard:${{ needs.release.outputs.version }}
+            bdelima/portainer-action-dashboard:latest

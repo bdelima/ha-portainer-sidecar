@@ -24,6 +24,14 @@ Two required environment variables:
 
 ## Running it
 
+A prebuilt, multi-arch (amd64/arm64) image is published to Docker Hub as
+[`bdelima/portainer-action-dashboard`](https://hub.docker.com/r/bdelima/portainer-action-dashboard),
+tagged both with each release version (see `VERSION`) and `latest` --
+built and pushed automatically by this repo's own GitHub Actions workflow
+on every version bump. Building from source (`build: .` / `docker build`)
+still works and is what that workflow itself does, but pulling the image
+is the faster path for normal use.
+
 ### Docker Compose
 
 Add a service like this to an existing stack (or create your own):
@@ -31,7 +39,7 @@ Add a service like this to an existing stack (or create your own):
 ```yaml
 services:
   portainer-action-dashboard:
-    build: .
+    image: bdelima/portainer-action-dashboard:latest
     container_name: portainer-action-dashboard
     restart: unless-stopped
     environment:
@@ -43,9 +51,19 @@ services:
     # "Security" below) rather than exposing port 8000 directly.
 ```
 
-Create a plain-text `ha_token` file next to the compose file containing your long-lived access token, then `docker compose up -d --build`.
+Create a plain-text `ha_token` file next to the compose file containing your long-lived access token, then `docker compose up -d`. (Swap `image:` for `build: .` if you'd rather build from source.)
 
 ### Docker directly
+
+```bash
+docker run -d \
+  -e HA_BASE_URL="https://homeassistant.example.com" \
+  -e HA_TOKEN="your-long-lived-access-token" \
+  -p 8000:8000 \
+  bdelima/portainer-action-dashboard:latest
+```
+
+### Building from source instead
 
 ```bash
 docker build -t portainer-action-dashboard .
@@ -55,6 +73,21 @@ docker run -d \
   -p 8000:8000 \
   portainer-action-dashboard
 ```
+
+## Versioning and publishing (maintainers)
+
+The `VERSION` file at the repo root is the single source of truth. Bump
+it and push to `main`, and `.github/workflows/docker-publish.yml` takes
+it from there: it creates a matching GitHub Release (tag = the version
+string), then builds and pushes the Docker Hub image tagged with that
+version and `latest`. Nothing else to do by hand -- no separate release
+step, no manual `docker push`.
+
+One-time setup this workflow depends on (Docker Hub and GitHub secrets,
+not something a workflow file can do for itself):
+
+1. Docker Hub -> Account Settings -> Personal access tokens -> create one scoped to Read & Write for this repo.
+2. GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret, twice: `DOCKERHUB_USERNAME` (your Docker Hub username) and `DOCKERHUB_TOKEN` (the access token from step 1, not your Docker Hub password).
 
 ## Security
 
