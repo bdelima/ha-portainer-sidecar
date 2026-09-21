@@ -98,6 +98,8 @@ async def get_action_items() -> dict[str, Any]:
             count = int(raw_state)
         except (TypeError, ValueError):
             count = 0
+        items = state.get("attributes", {}).get("items", [])
+        result[key] = {"count": count, "items": items}
     return result
 
 
@@ -129,6 +131,27 @@ async def delete_stale_devices(payload: DeleteStaleRequest) -> dict[str, Any]:
         except httpx.HTTPStatusError as exc:
             errors.append({"device_id": device_id, "error": str(exc)})
     return {"attempted": len(payload.device_ids), "errors": errors}
+
+
+class PruneImagesRequest(BaseModel):
+    dangling: bool = False
+    until_hours: int | None = None
+
+
+@app.post("/api/actions/prune-images")
+async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
+    # Delegates to portainer_maintenance.prune_images (HA side), which
+    # discovers every Portainer endpoint device on its own via the device
+    # registry and calls the core portainer.prune_images action once per
+    # host -- this app never needs to know host/device_ids itself.
+    data: dict[str, Any] = {"dangling": payload.dangling}
+    if payload.until_hours is not None:
+        data["until_hours"] = payload.until_hours
+    try:
+        await ha_call_service("portainer_maintenance", "prune_images", data)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"prune_images failed: {exc}") from exc
+    return {"ok": True}
 
 
 @app.get("/healthz")

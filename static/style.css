@@ -110,6 +110,36 @@ h1 {
 }
 .tab.active .count { background: var(--accent); color: #fff; }
 
+.maintenance-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+.maintenance-label { font-size: 0.8rem; color: var(--muted); margin-right: 4px; }
+.maintenance-hours {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  margin-left: auto;
+}
+.maintenance-hours input {
+  width: 48px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.85rem;
+}
+
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); }
 
 .item-table { width: 100%; border-collapse: collapse; }

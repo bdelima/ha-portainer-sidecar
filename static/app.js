@@ -334,6 +334,38 @@ el("clear-selection-btn").addEventListener("click", () => {
   render();
 });
 
+async function pruneImages(dangling, untilHours) {
+  const label = dangling ? "dangling images" : `images unused ${untilHours}h+`;
+  showToast(`Pruning ${label}…`);
+  try {
+    const res = await fetch("/api/actions/prune-images", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dangling, until_hours: dangling ? null : untilHours }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast(`Prune requested: ${label}`);
+  } catch (e) {
+    showToast("Prune failed — see console");
+    console.error(e);
+  }
+}
+
+el("prune-dangling-btn").addEventListener("click", () => pruneImages(true, null));
+el("prune-unused-btn").addEventListener("click", () => {
+  const hours = parseInt(el("prune-unused-hours").value, 10) || 48;
+  el("confirm-text").textContent =
+    `Remove unused (tagged) images that have had no container for ${hours}+ hours, on every Portainer host? This cannot be undone.`;
+  el("confirm-dialog").hidden = false;
+  el("confirm-ok").onclick = () => {
+    el("confirm-dialog").hidden = true;
+    pruneImages(false, hours);
+  };
+  el("confirm-cancel").onclick = () => {
+    el("confirm-dialog").hidden = true;
+  };
+});
+
 el("refresh-btn").addEventListener("click", loadActionItems);
 
 setupTabs();

@@ -22,6 +22,17 @@
     <button class="tab" data-tab="stale">Stale <span class="count" id="count-stale">0</span></button>
   </nav>
 
+  <div class="maintenance-bar">
+    <span class="maintenance-label">Image cleanup</span>
+    <button id="prune-dangling-btn" class="ghost-btn" title="Removes only untagged orphan layers -- never touches an image any container (running or stopped) still references. Safe to run anytime.">Clean dangling images</button>
+    <button id="prune-unused-btn" class="ghost-btn" title="Removes tagged images with no container referencing them (e.g. from a deleted stack), but only once they've been unused for at least the buffer below -- so a stack you stop and restart shortly after keeps its cached image.">Reclaim unused images</button>
+    <label class="maintenance-hours">
+      older than
+      <input type="number" id="prune-unused-hours" value="48" min="1" step="1">
+      h
+    </label>
+  </div>
+
   <main>
     <div id="empty-state" class="empty-state" hidden>
       <div class="empty-icon">✅</div>
