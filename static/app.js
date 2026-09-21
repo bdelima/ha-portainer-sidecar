@@ -162,10 +162,13 @@ function renderUpdatesRows() {
 
   const groups = groupUpdatesByStack(items);
 
-  // Nothing to group -- everything is standalone, or there's exactly one
-  // stack and no standalone containers alongside it. A tree with a single
-  // branch is just noise, so fall back to the original flat list.
-  if (groups.length === 1) {
+  // Nothing to group -- every pending item is standalone (no stack info
+  // at all), so a tree would just be a single "Standalone" branch, which
+  // is noise. Fall back to the original flat list in that one case only:
+  // a single *named* stack still gets its header shown below, even with
+  // just one item in it, since that's the only way to see the stack
+  // grouping is actually working when there's only one pending update.
+  if (groups.length === 1 && groups[0].key === "__standalone__") {
     for (const item of groups[0].items) tbody.appendChild(renderUpdateChildRow(item));
     return;
   }
