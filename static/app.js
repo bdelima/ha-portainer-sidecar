@@ -1,4 +1,4 @@
-// Portainer Action Dashboard frontend.
+// Portainer Sidecar frontend.
 //
 // Reads the three HA tracking sensors (sensor.portainer_updates_pending,
 // sensor.portainer_container_trouble, sensor.portainer_stale_devices) via
@@ -15,6 +15,15 @@ const state = {
   data: { updates: { count: 0, items: [] }, trouble: { count: 0, items: [] }, stale: { count: 0, items: [] } },
   selection: { updates: new Set(), stale: new Set() },
   haBaseUrl: "",
+  // Which stack groups are collapsed in the Updates tree (default: all
+  // expanded -- pending-update counts are usually small enough that
+  // collapsing by default would just be an extra click for most people).
+  collapsedStacks: new Set(),
+  // [{entity, stack_switch_entity_id}] accumulated across install actions
+  // -- kept as its own list (not derived from state.data) so a dismissed
+  // or already-restarted entry doesn't reappear just because the normal
+  // 15s poll refreshes state.data in the background.
+  stackRestartEntries: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -86,6 +95,62 @@ function emptyRow(colspan, text) {
   return tr;
 }
 
+// Groups pending-update items by their owning Portainer stack (sensor.py
+// resolves stack_name/stack_switch_entity_id from the device hierarchy --
+// see ha-portainer-dashboard's sensor.py, _stack_info). Standalone
+// containers (stack_name is null) land in one shared "Standalone" bucket,
+// sorted last, since they aren't a group anyone would want to
+// select/collapse as a unit -- they're just not part of any stack.
+function groupUpdatesByStack(items) {
+  const groups = new Map();
+  for (const item of items) {
+    const key = item.stack_name || "__standalone__";
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        label: item.stack_name || "Standalone",
+        switchEntityId: item.stack_switch_entity_id || null,
+        items: [],
+      });
+    }
+    groups.get(key).items.push(item);
+  }
+  const groupList = [...groups.values()];
+  groupList.sort((a, b) => {
+    if (a.key === "__standalone__") return 1;
+    if (b.key === "__standalone__") return -1;
+    return a.label.localeCompare(b.label);
+  });
+  return groupList;
+}
+
+function renderUpdateChildRow(item) {
+  const tr = document.createElement("tr");
+  tr.className = "stack-child-row";
+  if (state.selection.updates.has(item.entity)) tr.classList.add("selected");
+
+  const tdCheck = document.createElement("td");
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = state.selection.updates.has(item.entity);
+  cb.addEventListener("change", () => toggleSelection("updates", item.entity, cb.checked));
+  tdCheck.appendChild(cb);
+
+  const tdName = document.createElement("td");
+  tdName.innerHTML = `<div class="row-name row-name-indent">${escapeHtml(item.name)}</div>`;
+
+  const tdStatus = document.createElement("td");
+  const installBtn = document.createElement("button");
+  installBtn.className = "row-action-btn";
+  installBtn.textContent = "Install";
+  installBtn.addEventListener("click", () => installUpdates([item.entity]));
+  tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
+  tdStatus.appendChild(installBtn);
+
+  tr.append(tdCheck, tdName, tdStatus);
+  return tr;
+}
+
 function renderUpdatesRows() {
   const tbody = el("rows-updates");
   tbody.innerHTML = "";
@@ -94,32 +159,62 @@ function renderUpdatesRows() {
     tbody.appendChild(emptyRow(3, "No pending updates."));
     return;
   }
-  for (const item of items) {
-    const tr = document.createElement("tr");
-    if (state.selection.updates.has(item.entity)) tr.classList.add("selected");
+
+  const groups = groupUpdatesByStack(items);
+
+  // Nothing to group -- everything is standalone, or there's exactly one
+  // stack and no standalone containers alongside it. A tree with a single
+  // branch is just noise, so fall back to the original flat list.
+  if (groups.length === 1) {
+    for (const item of groups[0].items) tbody.appendChild(renderUpdateChildRow(item));
+    return;
+  }
+
+  for (const group of groups) {
+    const isStandalone = group.key === "__standalone__";
+    const groupEntities = group.items.map((i) => i.entity);
+    const allSelected = groupEntities.every((id) => state.selection.updates.has(id));
+    const someSelected = groupEntities.some((id) => state.selection.updates.has(id));
+    const expanded = !state.collapsedStacks.has(group.key);
+
+    const headerTr = document.createElement("tr");
+    headerTr.className = "stack-row";
 
     const tdCheck = document.createElement("td");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = state.selection.updates.has(item.entity);
-    cb.addEventListener("change", () => {
-      toggleSelection("updates", item.entity, cb.checked);
-    });
-    tdCheck.appendChild(cb);
+    if (!isStandalone) {
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = allSelected;
+      cb.indeterminate = someSelected && !allSelected;
+      cb.title = "Select every pending update in this stack";
+      cb.addEventListener("change", () => {
+        for (const id of groupEntities) {
+          if (cb.checked) state.selection.updates.add(id);
+          else state.selection.updates.delete(id);
+        }
+        render();
+      });
+      tdCheck.appendChild(cb);
+    }
+    headerTr.appendChild(tdCheck);
 
     const tdName = document.createElement("td");
-    tdName.innerHTML = `<div class="row-name">${escapeHtml(item.name)}</div>`;
+    tdName.colSpan = 2;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "stack-toggle";
+    toggle.textContent = `${expanded ? "▾" : "▸"} ${group.label} (${group.items.length})`;
+    toggle.addEventListener("click", () => {
+      if (expanded) state.collapsedStacks.add(group.key);
+      else state.collapsedStacks.delete(group.key);
+      render();
+    });
+    tdName.appendChild(toggle);
+    headerTr.appendChild(tdName);
+    tbody.appendChild(headerTr);
 
-    const tdStatus = document.createElement("td");
-    const installBtn = document.createElement("button");
-    installBtn.className = "row-action-btn";
-    installBtn.textContent = "Install";
-    installBtn.addEventListener("click", () => installUpdates([item.entity]));
-    tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
-    tdStatus.appendChild(installBtn);
-
-    tr.append(tdCheck, tdName, tdStatus);
-    tbody.appendChild(tr);
+    if (!expanded) continue;
+    for (const item of group.items) tbody.appendChild(renderUpdateChildRow(item));
   }
 }
 
@@ -249,8 +344,13 @@ async function installUpdates(entityIds) {
     });
     const result = await res.json();
     for (const id of entityIds) state.selection.updates.delete(id);
+    if (result.needs_stack_restart && result.needs_stack_restart.length > 0) {
+      state.stackRestartEntries.push(...result.needs_stack_restart);
+    }
     if (result.errors && result.errors.length > 0) {
       showToast(`Done with ${result.errors.length} error(s) — check backend logs`);
+    } else if (result.needs_stack_restart && result.needs_stack_restart.length > 0) {
+      showToast(`Installed ${entityIds.length} update(s) — stack restart needed, see below`);
     } else {
       showToast(`Installed ${entityIds.length} update(s)`);
     }
@@ -258,7 +358,90 @@ async function installUpdates(entityIds) {
     showToast("Install failed — see console");
     console.error(e);
   }
+  renderStackRestartBanner();
   loadActionItems();
+}
+
+// A container whose recreate hit the known network_mode:service:X daemon
+// conflict (see ha-portainer-dashboard's __init__.py) comes back updated
+// but needs its owning stack restarted to fully reconcile -- perform_update
+// already sends a phone push about this, but whoever's sitting at this
+// dashboard right now shouldn't have to go find their phone. Deliberately
+// never fires the restart automatically: it bounces every other container
+// in that stack too.
+function renderStackRestartBanner() {
+  const banner = el("stack-restart-banner");
+  const list = el("stack-restart-list");
+  list.innerHTML = "";
+
+  if (state.stackRestartEntries.length === 0) {
+    banner.hidden = true;
+    return;
+  }
+
+  const byStack = new Map();
+  for (const entry of state.stackRestartEntries) {
+    const key = entry.stack_switch_entity_id || "__unknown__";
+    if (!byStack.has(key)) byStack.set(key, []);
+    byStack.get(key).push(entry.entity);
+  }
+
+  for (const [switchEntityId, entities] of byStack) {
+    const row = document.createElement("div");
+    row.className = "stack-restart-row";
+
+    const label = document.createElement("span");
+    const n = entities.length;
+    label.textContent =
+      switchEntityId === "__unknown__"
+        ? `${n} container(s) updated but no stack could be identified to restart -- check Portainer manually.`
+        : `${n} container(s) updated, stack restart needed to finish cleanly.`;
+    row.appendChild(label);
+
+    if (switchEntityId !== "__unknown__") {
+      const btn = document.createElement("button");
+      btn.className = "row-action-btn";
+      btn.textContent = "Restart Stack Now";
+      btn.addEventListener("click", () => restartStack(switchEntityId));
+      row.appendChild(btn);
+    }
+
+    const dismiss = document.createElement("button");
+    dismiss.className = "icon-btn";
+    dismiss.textContent = "×";
+    dismiss.title = "Dismiss";
+    dismiss.addEventListener("click", () => {
+      state.stackRestartEntries = state.stackRestartEntries.filter(
+        (e) => (e.stack_switch_entity_id || "__unknown__") !== switchEntityId
+      );
+      renderStackRestartBanner();
+    });
+    row.appendChild(dismiss);
+
+    list.appendChild(row);
+  }
+
+  banner.hidden = false;
+}
+
+async function restartStack(switchEntityId) {
+  showToast("Restarting stack…");
+  try {
+    const res = await fetch("/api/actions/restart-stack", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ switch_entity_id: switchEntityId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    showToast("Stack restart requested");
+    state.stackRestartEntries = state.stackRestartEntries.filter(
+      (e) => e.stack_switch_entity_id !== switchEntityId
+    );
+    renderStackRestartBanner();
+  } catch (e) {
+    showToast("Restart failed — see console");
+    console.error(e);
+  }
 }
 
 function confirmDeleteSelected() {

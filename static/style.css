@@ -11,6 +11,9 @@
   --row-hover: #f0f4fa;
   --chip-bg: #eef2f7;
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --warn: #a15c00;
+  --warn-bg: #fff4e0;
+  --warn-border: #f0d8a8;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -27,6 +30,9 @@
     --row-hover: #262a32;
     --chip-bg: #2a2d34;
     --shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    --warn: #ffc76b;
+    --warn-bg: #3a2e14;
+    --warn-border: #5c4a20;
   }
 }
 
@@ -277,5 +283,47 @@ h1 {
   box-shadow: var(--shadow);
   font-size: 0.85rem;
 }
+
+/* Stack-grouped tree (Updates tab) */
+.stack-row td {
+  background: var(--chip-bg);
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+.stack-toggle {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 0.9rem;
+  cursor: pointer;
+  padding: 2px 0;
+  text-align: left;
+}
+.row-name-indent { padding-left: 20px; }
+
+/* Stack-restart-needed banner */
+.stack-restart-banner {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--warn-border);
+  border-radius: 8px;
+  background: var(--warn-bg);
+}
+.stack-restart-header {
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+}
+.stack-restart-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 0;
+  font-size: 0.85rem;
+}
+.stack-restart-row:not(:last-child) { border-bottom: 1px solid var(--warn-border); }
+.stack-restart-row span { flex: 1; color: var(--text); }
 
 [hidden] { display: none !important; }

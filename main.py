@@ -1,4 +1,4 @@
-"""Portainer Action Dashboard.
+"""Portainer Sidecar.
 
 A small standalone web app giving a real, multi-select management UI for the
 action items tracked by the Home Assistant Portainer automation set
@@ -13,23 +13,41 @@ server-side only -- it is never sent to the browser -- and proxies a
 handful of read/action endpoints to HA's REST API. The frontend (static/)
 is a plain HTML/JS page served by this same app.
 
-Required environment variables:
-    HA_BASE_URL   e.g. https://homeassistant.example.com
-    HA_TOKEN      a Home Assistant long-lived access token (Profile ->
-                  Security -> Long-Lived Access Tokens). Treat this as a
-                  secret with full API access as whichever HA user created
-                  it. Pass it via an env file / Docker secret (or
-                  HA_TOKEN_FILE, below), never bake it into the image.
+Environment variables:
+    HA_BASE_URL     Optional. Home Assistant's address for this app's own
+                     server-to-server REST calls, e.g. http://ojochal.lan:8123.
+                     If unset, this app auto-discovers HA on startup (see
+                     `_discover_ha_base_url` below) -- the expected setup is
+                     this container co-located with HA on the same Docker
+                     host, which is the only scenario this app supports.
+    HA_PUBLIC_URL   Optional. A browser-reachable HA address used only to
+                     build "open in Home Assistant" links in the UI (history
+                     page, device pages) -- separate from HA_BASE_URL because
+                     an auto-discovered address (a container name or an
+                     internal docker-network IP) is meaningless to your
+                     phone/laptop browser. If unset, those links just don't
+                     render; everything else still works. If you set
+                     HA_BASE_URL explicitly to something your browser can
+                     also reach (e.g. https://ha.pumapants.cc), that's reused
+                     here automatically -- no need to set both.
+    HA_TOKEN        a Home Assistant long-lived access token (Profile ->
+                     Security -> Long-Lived Access Tokens). Treat this as a
+                     secret with full API access as whichever HA user created
+                     it. Pass it via an env file / Docker secret (or
+                     HA_TOKEN_FILE, below), never bake it into the image.
 """
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import os
+import socket
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 def _load_token() -> str:
     """Prefer a mounted secret file (HA_TOKEN_FILE) over a plain env var
@@ -42,7 +60,107 @@ def _load_token() -> str:
     return os.environ["HA_TOKEN"]
 
 
-HA_BASE_URL = os.environ["HA_BASE_URL"].rstrip("/")
+HA_DISCOVERY_PORT = 8123
+# Common container/service names for Home Assistant -- tried first via
+# Docker's own embedded DNS, which resolves instantly (no network I/O) when
+# this container shares a user-defined network with HA's, e.g. Bob's
+# standardized `npm_proxy` network used across every stack.
+_HA_HOSTNAME_CANDIDATES = ("homeassistant", "home-assistant", "hass", "ha")
+
+
+def _default_gateway() -> str | None:
+    """This container's default-route gateway -- on a Docker bridge network
+    that's the Docker host itself, so this is how we reach HA if it's
+    running directly on the host (host network mode) rather than as a
+    container sharing our own bridge network. Linux-only (/proc/net/route),
+    which is fine since this only ever runs inside a Linux container."""
+    try:
+        with open("/proc/net/route", encoding="ascii") as f:
+            for line in f.readlines()[1:]:
+                fields = line.split()
+                if fields[1] == "00000000":  # destination 0.0.0.0 = default route
+                    return socket.inet_ntoa(bytes.fromhex(fields[2])[::-1])
+    except OSError:
+        return None
+    return None
+
+
+def _own_subnet() -> ipaddress.IPv4Network | None:
+    """This container's own IP, assumed /24. True for every Docker
+    user-defined bridge network -- which is what every stack in this
+    homelab uses (never the default /16 bridge) -- so scanning it is a
+    quick ~254-address sweep, not a subnet-wide crawl."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ipaddress.ip_network(f"{ip}/24", strict=False)
+    except OSError:
+        return None
+
+
+async def _looks_like_home_assistant(client: httpx.AsyncClient, base_url: str) -> bool:
+    """Fingerprint check with no credentials involved: HA serves its PWA
+    manifest at /manifest.json to anyone, unauthenticated, with a
+    recognizable `name`. Deliberately doesn't send HA_TOKEN during
+    discovery -- we don't yet know this address is actually HA, and this
+    container's LAN segment isn't a place to hand our bearer token to
+    whatever happens to answer on port 8123."""
+    try:
+        resp = await client.get(f"{base_url}/manifest.json", timeout=1.5)
+        return resp.status_code == 200 and resp.json().get("name") == "Home Assistant"
+    except Exception:
+        return False
+
+
+async def _discover_ha_base_url() -> str:
+    """Runs once at startup when HA_BASE_URL isn't set. Order: (1) common
+    container names on this container's own docker network -- covers the
+    normal case, HA and this app sharing a user-defined network; (2) a scan
+    of this container's own /24 -- covers HA being reachable on the same
+    docker network under a name we didn't guess; (3) the docker host itself
+    -- covers HA running directly on the host, or in host network mode.
+    Raises if none of that finds anything, so the container fails fast
+    with a clear reason instead of serving with a broken backend."""
+    async with httpx.AsyncClient() as client:
+        for name in _HA_HOSTNAME_CANDIDATES:
+            url = f"http://{name}:{HA_DISCOVERY_PORT}"
+            if await _looks_like_home_assistant(client, url):
+                return url
+
+        subnet = _own_subnet()
+        if subnet is not None:
+            candidates = [f"http://{ip}:{HA_DISCOVERY_PORT}" for ip in subnet.hosts()]
+            checks = await asyncio.gather(
+                *(_looks_like_home_assistant(client, url) for url in candidates)
+            )
+            for url, found in zip(candidates, checks):
+                if found:
+                    return url
+
+        gateway = _default_gateway()
+        for host in (gateway, "host.docker.internal"):
+            if not host:
+                continue
+            url = f"http://{host}:{HA_DISCOVERY_PORT}"
+            if await _looks_like_home_assistant(client, url):
+                return url
+
+    raise RuntimeError(
+        "HA_BASE_URL isn't set and auto-discovery couldn't find a Home "
+        "Assistant instance on this container's docker network, its /24 "
+        "subnet, or the docker host itself. Set HA_BASE_URL explicitly "
+        "(e.g. http://ojochal.lan:8123) and restart."
+    )
+
+
+# Left unresolved until the startup handler below runs (or immediately, if
+# set explicitly) -- see module docstring.
+HA_BASE_URL: str | None = (os.environ.get("HA_BASE_URL") or "").rstrip("/") or None
+HA_PUBLIC_URL: str | None = (os.environ.get("HA_PUBLIC_URL") or "").rstrip("/") or None
 HA_TOKEN = _load_token()
 
 HEADERS = {
@@ -57,6 +175,20 @@ SENSORS = {
 }
 
 app = FastAPI(title="Portainer Sidecar")
+
+
+@app.on_event("startup")
+async def _ensure_ha_base_url() -> None:
+    global HA_BASE_URL, HA_PUBLIC_URL
+    if HA_BASE_URL is None:
+        HA_BASE_URL = await _discover_ha_base_url()
+        print(f"[startup] HA_BASE_URL not set -- auto-discovered Home Assistant at {HA_BASE_URL}")
+    if HA_PUBLIC_URL is None and os.environ.get("HA_BASE_URL"):
+        # Only reuse HA_BASE_URL for browser links if the user set it
+        # explicitly -- an auto-discovered address (container name or
+        # internal docker IP) is meaningless to a phone/laptop browser, so
+        # it's never used here even though it's sitting right above.
+        HA_PUBLIC_URL = HA_BASE_URL
 
 
 async def ha_get_state(entity_id: str) -> dict[str, Any]:
@@ -78,11 +210,32 @@ async def ha_call_service(domain: str, service: str, data: dict[str, Any]) -> No
         resp.raise_for_status()
 
 
+async def ha_call_service_with_response(domain: str, service: str, data: dict[str, Any]) -> dict[str, Any]:
+    """Same as ha_call_service, but for a service registered with
+    supports_response (perform_update below) -- the ?return_response query
+    param is what makes HA's REST API include service_response in the body
+    at all; a service that doesn't support it (or a caller that forgets
+    the query param on one that does) gets a 400, per HA's own REST API
+    docs. Returns the raw service_response dict -- perform_update's shape
+    is {"needs_stack_restart": bool, "stack_switch_entity_id": str|None},
+    not the per-entity-keyed shape HA uses for target-based services, since
+    this one isn't called with a target/entity_id selector."""
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{HA_BASE_URL}/api/services/{domain}/{service}?return_response",
+            headers=HEADERS,
+            json=data,
+        )
+        resp.raise_for_status()
+        return resp.json().get("service_response", {})
+
+
 @app.get("/api/config")
 async def get_config() -> dict[str, str]:
-    # HA_BASE_URL itself isn't sensitive (unlike HA_TOKEN) -- the frontend
-    # needs it to build "open in Home Assistant" links for device pages.
-    return {"ha_base_url": HA_BASE_URL}
+    # Deliberately HA_PUBLIC_URL here, not HA_BASE_URL -- see module
+    # docstring. Neither is sensitive (unlike HA_TOKEN); the frontend uses
+    # this to build "open in Home Assistant" links for device/history pages.
+    return {"ha_base_url": HA_PUBLIC_URL or ""}
 
 
 @app.get("/api/action-items")
@@ -110,12 +263,64 @@ class InstallRequest(BaseModel):
 @app.post("/api/actions/install")
 async def install_updates(payload: InstallRequest) -> dict[str, Any]:
     errors = []
+    needs_stack_restart = []
     for entity_id in payload.update_entities:
         try:
-            await ha_call_service("portainer_maintenance", "perform_update", {"update_entity": entity_id})
+            response = await ha_call_service_with_response(
+                "portainer_maintenance", "perform_update", {"update_entity": entity_id}
+            )
         except httpx.HTTPStatusError as exc:
             errors.append({"entity": entity_id, "error": str(exc)})
-    return {"attempted": len(payload.update_entities), "errors": errors}
+            continue
+        # A phone push already went out from the HA side either way (see
+        # perform_update's own docstring) -- this is additive, so whoever's
+        # sitting at the dashboard right now doesn't have to go find their
+        # phone to notice a stack needs restarting.
+        if response.get("needs_stack_restart"):
+            needs_stack_restart.append(
+                {
+                    "entity": entity_id,
+                    "stack_switch_entity_id": response.get("stack_switch_entity_id"),
+                }
+            )
+    return {
+        "attempted": len(payload.update_entities),
+        "errors": errors,
+        "needs_stack_restart": needs_stack_restart,
+    }
+
+
+class RestartStackRequest(BaseModel):
+    switch_entity_id: str
+
+    @field_validator("switch_entity_id")
+    @classmethod
+    def _must_be_a_switch_entity(cls, value: str) -> str:
+        # This app has no auth of its own (see README "Security"), same as
+        # every other endpoint here -- this isn't a security boundary, just
+        # a cheap sanity check against a stray non-switch entity_id (e.g. a
+        # typo, or a stale value from state.stackRestartEntries) reaching
+        # the portainer_maintenance.restart_stack service, which itself
+        # just does cv.entity_id and would happily stop/start whatever
+        # entity_id it's handed.
+        if not value.startswith("switch."):
+            raise ValueError("switch_entity_id must be a switch.* entity")
+        return value
+
+
+@app.post("/api/actions/restart-stack")
+async def restart_stack(payload: RestartStackRequest) -> dict[str, Any]:
+    # Deliberately a separate, explicit tap -- never fired automatically
+    # after install above, even though we already know a stack needs it.
+    # A stack restart bounces every other container in it too, which
+    # shouldn't happen without confirmation.
+    try:
+        await ha_call_service(
+            "portainer_maintenance", "restart_stack", {"switch_entity_id": payload.switch_entity_id}
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"restart_stack failed: {exc}") from exc
+    return {"ok": True}
 
 
 class DeleteStaleRequest(BaseModel):
