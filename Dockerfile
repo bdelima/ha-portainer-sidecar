@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY main.py .
 COPY static/ static/
+COPY VERSION .
 
 EXPOSE 8000
 

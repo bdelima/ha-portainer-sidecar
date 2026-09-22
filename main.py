@@ -60,6 +60,24 @@ def _load_token() -> str:
     return os.environ["HA_TOKEN"]
 
 
+def _read_version() -> str:
+    """The app's own version, from the VERSION file baked into the image at
+    build time (see Dockerfile). Without this there was no way -- not from
+    `docker inspect`, not from the app itself -- to ask a *running*
+    container which version it actually was; "latest" and a creation
+    timestamp were the only clues available, which is not a version number.
+    Read once at import time rather than per-request, since it never
+    changes for the life of a running container."""
+    try:
+        with open("VERSION", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return "unknown"
+
+
+APP_VERSION = _read_version()
+
+
 HA_DISCOVERY_PORT = 8123
 # Common container/service names for Home Assistant -- tried first via
 # Docker's own embedded DNS, which resolves instantly (no network I/O) when
@@ -372,7 +390,18 @@ async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
+
+
+@app.get("/version")
+async def version() -> dict[str, str]:
+    """What version this specific running container actually is -- answers
+    "sudo docker exec ha-portainer-sidecar cat VERSION" or a plain
+    `curl http://<host>:8000/version` without needing shell access to the
+    container at all. Deliberately separate from /healthz (which also now
+    includes it) so a version check reads clearly in logs/monitoring rather
+    than looking like a health probe."""
+    return {"version": APP_VERSION}
 
 
 # Static frontend last, so it doesn't shadow the /api/* routes above.
