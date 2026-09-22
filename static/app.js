@@ -145,7 +145,25 @@ function renderUpdateChildRow(item) {
   installBtn.textContent = "Install";
   installBtn.addEventListener("click", () => installUpdates([item.entity]));
   tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
+  // Appended before the changelog link since both float right -- float
+  // stacks each subsequent element to the LEFT of the previous one, so
+  // Install (appended first) ends up rightmost/primary and Changelog
+  // (appended second, when present) sits just to its left.
   tdStatus.appendChild(installBtn);
+  if (item.changelog_url) {
+    // Only present for images in ha-portainer-dashboard's hand-curated
+    // _KNOWN_CHANGELOG_URLS table (sensor.py) -- core's update.* entities
+    // carry no changelog data of their own to read here. Omitted
+    // entirely for anything not in that table, same as before this
+    // feature existed.
+    const changelogLink = document.createElement("a");
+    changelogLink.className = "row-changelog-link";
+    changelogLink.href = item.changelog_url;
+    changelogLink.target = "_blank";
+    changelogLink.rel = "noopener";
+    changelogLink.textContent = "Changelog";
+    tdStatus.appendChild(changelogLink);
+  }
 
   tr.append(tdCheck, tdName, tdStatus);
   return tr;

@@ -185,6 +185,19 @@ h1 {
 }
 .row-action-btn:hover { background: var(--accent-hover); }
 
+.row-changelog-link {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.8rem;
+  text-decoration: none;
+  float: right;
+  margin-right: 8px;
+}
+.row-changelog-link:hover { background: var(--row-hover); }
+
 .empty-state {
   text-align: center;
   padding: 48px 16px;
