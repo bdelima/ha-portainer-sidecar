@@ -45,7 +45,7 @@ import socket
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
@@ -193,6 +193,33 @@ SENSORS = {
 }
 
 app = FastAPI(title="Portainer Sidecar")
+
+
+@app.middleware("http")
+async def _no_cache(request: Request, call_next):
+    """Every response from this app, static assets included, is explicitly
+    marked never to be cached.
+
+    Starlette's StaticFiles (what serves static/index.html, app.js,
+    style.css below) sets no Cache-Control header of its own -- with none
+    present, browsers fall back to *heuristic* caching, guessing a freshness
+    lifetime from the file's Last-Modified age and sometimes serving a
+    cached copy straight out of disk cache without ever asking the server
+    again. This bit in production (1.2.2): after a real image update that
+    changed index.html's heading, a browser viewing this app through Home
+    Assistant's iframe panel kept showing the old heading through repeated
+    reloads (even a hard reload) -- only explicitly disabling the browser
+    cache in devtools forced a real request. An iframe's subresource fetches
+    don't reliably get the same "bypass cache" treatment a top-level hard
+    reload gives the page you're actually looking at, so relying on the user
+    to know to hard-refresh (or disable cache) isn't a fix, it's a workaround.
+    This app is small and low-traffic -- there's no real cost to just never
+    caching anything, so `no-store` on every response removes the whole
+    class of "why does this still look old" confusion for good, in the
+    browser tab, the HA iframe, or anywhere else this gets embedded."""
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.on_event("startup")
