@@ -219,8 +219,19 @@ async def ha_call_service_with_response(domain: str, service: str, data: dict[st
     docs. Returns the raw service_response dict -- perform_update's shape
     is {"needs_stack_restart": bool, "stack_switch_entity_id": str|None},
     not the per-entity-keyed shape HA uses for target-based services, since
-    this one isn't called with a target/entity_id selector."""
-    async with httpx.AsyncClient(timeout=30) as client:
+    this one isn't called with a target/entity_id selector.
+
+    180s timeout, not the 30s every other call here uses: as of the
+    integration's stack-restart-needed detection rewrite, perform_update
+    can itself block for up to 150s on a container that's part of a stack
+    (it watches the container's actual image reference across at least
+    two of core's own 60s Portainer-poll cycles before concluding a
+    recreate genuinely failed, rather than trusting HA core's own
+    generic-wrapped exception text -- see the integration's
+    _await_recreate_outcome for why). A shorter client timeout here would
+    surface a false timeout error to the user while the backend was still
+    correctly working it out."""
+    async with httpx.AsyncClient(timeout=180) as client:
         resp = await client.post(
             f"{HA_BASE_URL}/api/services/{domain}/{service}?return_response",
             headers=HEADERS,
