@@ -812,19 +812,13 @@ function renderStaleRows() {
 }
 
 // ---------------------------------------------------------------------
-// Cleanup tab (1.3.0, new) -- endpoint -> three fixed, ordered actions:
-// Clean dangling images -> Reclaim all images -> Prune unused volumes.
-// No checkboxes/batch model: each row's button acts immediately on that
-// one endpoint. Ordering itself implies the intended workflow (do the
-// safe thing first); rows never disappear or reorder based on state.
+// Cleanup tab (1.3.0, new) -- endpoint -> fixed, ordered actions: Prune
+// images -> Prune unused volumes. (1.3.3: was three actions -- Clean
+// dangling images / Reclaim all images / Prune unused volumes -- until the
+// first two turned out to be the same operation in practice; see the
+// (1.3.3) comment in renderCleanupRows for why.) No checkboxes/batch model:
+// each row's button acts immediately on that one endpoint.
 // ---------------------------------------------------------------------
-
-function mibToCompactGb(mib) {
-  if (mib === null || mib === undefined) return null;
-  const gb = mib / 1024;
-  if (gb < 0.05) return "<0.1 GB";
-  return `${gb.toFixed(gb < 10 ? 1 : 0)} GB`;
-}
 
 function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, indent, onClick }) {
   const tr = document.createElement("tr");
@@ -891,58 +885,59 @@ function renderCleanupRows() {
     }
 
     const indent = !singleEndpoint;
-    // (1.3.2) unused_estimate is images_count - containers_count from
-    // core's own per-endpoint diagnostics -- not an actual dangling-image
-    // count (nothing in HA exposes one). It used to sit on "Clean dangling
-    // images" specifically, which claimed a precision the number doesn't
-    // have: a figure about images beyond what's currently running, badging
-    // an action that only ever touches genuinely untagged/unreferenced
-    // layers. It's shown at the endpoint header (as that endpoint's overall
-    // count) and here, next to Reclaim's own byte-accurate badge, since
-    // "images beyond what's running" is what Reclaim all images actually
-    // acts on -- but never on the dangling-images row, which has no
-    // reliable count to show at all.
-    const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
-    const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const reclaimRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
-
-    // 1. Clean dangling images -- always safe, no confirmation.
-    const danglingKey = `cleanup-dangling:${ep.device_id}`;
+    // (1.3.3) There used to be two separate image actions here -- "Clean
+    // dangling images" (dangling=true) and "Reclaim all images"
+    // (dangling=false, meant to also remove tagged-but-unused images). The
+    // dangling-only button is now hidden: core's `portainer.prune_images`
+    // service calls pyportainer's images_prune(), which builds its request
+    // as bare `?dangling=...`/`?until=...` query params instead of Docker's
+    // actual required shape -- a JSON `filters` query param (confirmed
+    // against Docker Engine's own API spec, moby/moby's api/swagger.yaml,
+    // ImagePrune operation). Docker's daemon never sees a real dangling
+    // filter either way, so it always falls back to its own default prune
+    // scope -- dangling-only -- no matter which value HA sends. That made
+    // the two buttons functionally identical: keeping both, one of them
+    // silently not doing what its label promised, was worse than keeping
+    // one and being honest about its current scope.
+    //
+    // Deliberately still wired as dangling=false (the original "Reclaim"
+    // call), NOT switched to dangling=true -- this is the one line that
+    // will start actually reclaiming every unused image, not just dangling
+    // ones, the moment pyportainer's images_prune() is fixed upstream (see
+    // the pyportainer-images-prune-bug-report.md handed to Bob -- no fix or
+    // report existed yet as of this writing). Leaving the real wiring in
+    // place means that fix requires zero changes on our side to take
+    // effect; only the button's copy needs to catch up today.
+    //
+    // No badge here: unused_estimate (images beyond what's running) and
+    // reclaimable_mib (byte-accurate, but across ALL unused images) both
+    // describe a broader scope than this action can actually reach right
+    // now, so showing either next to this specific button would repeat the
+    // exact "pretending we know a number we don't" problem already fixed
+    // once on this tab. unused_estimate still surfaces at the endpoint
+    // header above, as a household-wide "how much is piling up" figure, not
+    // a promise about what pressing this button will remove.
+    const pruneKey = `cleanup-prune-images:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
-        label: "Clean dangling images",
-        note: "Untagged orphan layers only — never referenced by any container, running or stopped.",
+        label: "Prune images",
+        note: "Removes dangling (untagged, unreferenced) images only. Note that image counts not resetting to 0 is indicative of current API limitations that restrict pruning all unused images. Further pruning would require direct action using the endpoint's Portainer UI.",
         badgeText: null,
-        buttonText: "Clean",
-        pendingText: "Cleaning…",
-        pending: isPending(danglingKey),
-        indent,
-        onClick: () => runPending(danglingKey, () => pruneImages(true, null, [ep.device_id])),
-      })
-    );
-
-    // 2. Reclaim all images -- no age buffer, confirm dialog.
-    const reclaimKey = `cleanup-reclaim:${ep.device_id}`;
-    tbody.appendChild(
-      renderCleanupActionRow({
-        label: "Reclaim all images",
-        note: "Removes every tagged image with no referencing container, immediately. A container started again afterward just re-pulls its image.",
-        badgeText: reclaimRowBadge,
-        buttonText: "Reclaim",
-        pendingText: "Reclaiming…",
-        pending: isPending(reclaimKey),
+        buttonText: "Prune",
+        pendingText: "Pruning…",
+        pending: isPending(pruneKey),
         indent,
         onClick: () => {
           showConfirmDialog(
             `Remove every unused image on ${ep.host}? This cannot be undone — a container started again afterward will need to re-pull its image.`,
-            "Reclaim",
-            () => runPending(reclaimKey, () => pruneImages(false, null, [ep.device_id]))
+            "Prune",
+            () => runPending(pruneKey, () => pruneImages(false, null, [ep.device_id]))
           );
         },
       })
     );
 
-    // 3. Prune unused volumes -- courtesy action, confirm dialog.
+    // 2. Prune unused volumes -- courtesy action, confirm dialog.
     const volumesKey = `cleanup-volumes:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
