@@ -184,6 +184,7 @@ h1 {
   float: right;
 }
 .row-action-btn:hover { background: var(--accent-hover); }
+.row-action-btn:disabled { background: var(--muted); cursor: default; opacity: 0.7; }
 
 .row-changelog-link {
   background: none;
@@ -338,5 +339,13 @@ h1 {
 }
 .stack-restart-row:not(:last-child) { border-bottom: 1px solid var(--warn-border); }
 .stack-restart-row span { flex: 1; color: var(--text); }
+/* Overrides the generic ".stack-restart-row span" rule above (needs equal
+   specificity via the parent class) so a persisted restart-failure message
+   doesn't compete for space 50/50 with the row's main label. */
+.stack-restart-row .stack-restart-error {
+  flex: 0 1 auto;
+  color: var(--danger);
+  font-size: 0.8rem;
+}
 
 [hidden] { display: none !important; }

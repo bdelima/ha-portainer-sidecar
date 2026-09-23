@@ -24,6 +24,11 @@ const state = {
   // or already-restarted entry doesn't reappear just because the normal
   // 15s poll refreshes state.data in the background.
   stackRestartEntries: [],
+  // switchEntityId -> last error message, when a restart-stack call
+  // failed -- kept separately from stackRestartEntries so a failure
+  // persists visibly across re-renders until dismissed or retried,
+  // instead of only flashing in a toast for 4 seconds.
+  stackRestartErrors: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -143,7 +148,10 @@ function renderUpdateChildRow(item) {
   const installBtn = document.createElement("button");
   installBtn.className = "row-action-btn";
   installBtn.textContent = "Install";
-  installBtn.addEventListener("click", () => installUpdates([item.entity]));
+  installBtn.addEventListener("click", () => {
+    const restore = withBusy(installBtn, "Installing…");
+    installUpdates([item.entity]).finally(restore);
+  });
   tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
   // Appended before the changelog link since both float right -- float
   // stacks each subsequent element to the LEFT of the previous one, so
@@ -337,7 +345,10 @@ function renderActionBar() {
   btn.textContent = category === "stale" ? `Delete ${sel.size} device(s)` : `Install ${sel.size} update(s)`;
   btn.onclick = () => {
     if (category === "stale") confirmDeleteSelected();
-    else installUpdates([...sel]);
+    else {
+      const restore = withBusy(btn, `Installing ${sel.size} update(s)…`);
+      installUpdates([...sel]).finally(restore);
+    }
   };
 }
 
@@ -423,8 +434,26 @@ function renderStackRestartBanner() {
       const btn = document.createElement("button");
       btn.className = "row-action-btn";
       btn.textContent = "Restart Stack Now";
-      btn.addEventListener("click", () => restartStack(switchEntityId));
+      btn.addEventListener("click", () => {
+        const restore = withBusy(btn, "Restarting…");
+        restartStack(switchEntityId).finally(restore);
+      });
       row.appendChild(btn);
+
+      // A failed restart-stack call used to leave this row looking
+      // exactly like it did before the click -- no disabled/busy state
+      // (fixed above) AND no lasting sign anything went wrong beyond a
+      // toast that's gone in 4 seconds, easy to miss while watching the
+      // button itself. state.stackRestartErrors persists the actual
+      // error text here until the next click or an explicit dismiss, so
+      // "it just sits there" always has an answer as to why.
+      const errorText = state.stackRestartErrors.get(switchEntityId);
+      if (errorText) {
+        const errorSpan = document.createElement("span");
+        errorSpan.className = "stack-restart-error";
+        errorSpan.textContent = errorText;
+        row.appendChild(errorSpan);
+      }
     }
 
     const dismiss = document.createElement("button");
@@ -435,6 +464,7 @@ function renderStackRestartBanner() {
       state.stackRestartEntries = state.stackRestartEntries.filter(
         (e) => (e.stack_switch_entity_id || "__unknown__") !== switchEntityId
       );
+      state.stackRestartErrors.delete(switchEntityId);
       renderStackRestartBanner();
     });
     row.appendChild(dismiss);
@@ -453,16 +483,26 @@ async function restartStack(switchEntityId) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ switch_entity_id: switchEntityId }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch {
+        // Response wasn't JSON -- fall through with just the status.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
     showToast("Stack restart requested");
     state.stackRestartEntries = state.stackRestartEntries.filter(
       (e) => e.stack_switch_entity_id !== switchEntityId
     );
-    renderStackRestartBanner();
+    state.stackRestartErrors.delete(switchEntityId);
   } catch (e) {
     showToast("Restart failed — see console");
     console.error(e);
+    state.stackRestartErrors.set(switchEntityId, `Restart failed: ${e.message}`);
   }
+  renderStackRestartBanner();
 }
 
 function confirmDeleteSelected() {
@@ -503,6 +543,28 @@ async function deleteStaleDevices(deviceIds) {
 }
 
 let toastTimer = null;
+// Every action button (row Install, batch Install, Restart Stack Now) used
+// to give NO visual acknowledgement of a click beyond a toast that a lot of
+// people simply don't look at while their eyes are on the button waiting
+// for something to change -- confirmed in practice as "it just sits there
+// looking like you never pressed it," for both Install and Restart Stack
+// Now alike. This wraps any such button: disables it and swaps its label
+// to a busy state immediately on click, and returns a restore function the
+// caller runs once the action settles (success OR failure) to put it back
+// -- a no-op if the button's already been removed from the DOM by a
+// subsequent re-render, which is exactly what happens on a successful
+// install/restart.
+function withBusy(btn, busyText) {
+  const originalText = btn.textContent;
+  const originalDisabled = btn.disabled;
+  btn.disabled = true;
+  btn.textContent = busyText;
+  return () => {
+    btn.disabled = originalDisabled;
+    btn.textContent = originalText;
+  };
+}
+
 function showToast(text) {
   const toast = el("toast");
   toast.textContent = text;
