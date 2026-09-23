@@ -24,6 +24,15 @@ const state = {
   // name under two different endpoints never collides.
   collapsedEndpoints: new Set(),
   collapsedStacks: new Set(),
+  // (1.3.1) A failed "Restart Stack Now" gets a persistent inline error on
+  // the Trouble tab's stack row, not just a toast -- this is the one action
+  // in the whole app where a silent failure is actively misleading (tap it,
+  // assume the stack recovered, walk away). Keyed by switch_entity_id;
+  // cleared on the next successful restart of that stack, or dropped by
+  // pruneStackRestartErrors() once that stack no longer shows a
+  // stack_restart_needed item at all (resolved some other way -- manual
+  // Portainer intervention, an endpoint reload, etc).
+  stackRestartErrors: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -53,6 +62,7 @@ async function loadActionItems() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     state.data = await res.json();
     pruneSelection();
+    pruneStackRestartErrors();
     render();
     el("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch (e) {
@@ -75,6 +85,24 @@ function pruneSelection() {
 
 function staleDeviceId(item) {
   return item?.device_id || null;
+}
+
+// Drop a persistent restart error once its stack no longer has an open
+// stack_restart_needed item -- the underlying problem cleared some other
+// way (manual Portainer intervention, an endpoint reload bringing things
+// back cleanly, etc), so the stale error would otherwise sit there forever
+// with nothing to retry.
+function pruneStackRestartErrors() {
+  if (state.stackRestartErrors.size === 0) return;
+  const stillNeedsRestart = new Set(
+    (state.data.trouble.items || [])
+      .filter((i) => i.kind === "stack_restart_needed")
+      .map((i) => i.stack_switch_entity_id || i.switch_entity_id)
+      .filter(Boolean)
+  );
+  for (const switchEntityId of [...state.stackRestartErrors.keys()]) {
+    if (!stillNeedsRestart.has(switchEntityId)) state.stackRestartErrors.delete(switchEntityId);
+  }
 }
 
 function render() {
@@ -379,6 +407,23 @@ function troubleViewLink(item) {
   return link;
 }
 
+// (1.3.1) Persistent inline error under a stack's header row after a
+// failed "Restart Stack Now" -- shown regardless of the stack's own
+// expand/collapse state, since this is the one failure in the app that
+// genuinely needs to stay visible rather than auto-dismiss like a toast.
+// Cleared by pruneStackRestartErrors() once the stack no longer needs a
+// restart, or immediately on the next restart attempt (see restartStack).
+function renderStackRestartErrorRow(message, indent) {
+  const tr = document.createElement("tr");
+  tr.className = "stack-restart-error-row";
+  const td = document.createElement("td");
+  td.colSpan = 2;
+  const indentClass = indent ? "row-name-indent" : "";
+  td.innerHTML = `<div class="stack-restart-error ${indentClass}">Restart failed: ${escapeHtml(message)}</div>`;
+  tr.appendChild(td);
+  return tr;
+}
+
 function renderTroubleChildRow(item, indentLevel) {
   const tr = document.createElement("tr");
   const tdName = document.createElement("td");
@@ -505,6 +550,8 @@ function renderTroubleRows() {
             : null,
         })
       );
+      const restartError = stack.switchEntityId && state.stackRestartErrors.get(stack.switchEntityId);
+      if (restartError) tbody.appendChild(renderStackRestartErrorRow(restartError, !singleEndpoint));
       if (!stackExpanded) continue;
       for (const item of stack.items) tbody.appendChild(renderTroubleChildRow(item, childIndent));
     }
@@ -815,6 +862,11 @@ async function installUpdates(entityIds) {
 
 async function restartStack(switchEntityId) {
   showToast("Restarting stack…");
+  // A retry attempt clears any previous error immediately, whether or not
+  // this attempt itself succeeds -- the row shouldn't show a stale error
+  // for an action that's actively in flight again.
+  state.stackRestartErrors.delete(switchEntityId);
+  render();
   try {
     const res = await fetch("/api/actions/restart-stack", {
       method: "POST",
@@ -832,7 +884,12 @@ async function restartStack(switchEntityId) {
     }
     showToast("Stack restart requested");
   } catch (e) {
+    // Toast alone isn't enough here -- it auto-dismisses, and someone
+    // acting on a phone notification may not even be looking at the
+    // webapp when this fires. A failed stack restart needs a persistent,
+    // unmissable signal, not just a message that disappears in 4 seconds.
     showToast(`Restart failed — ${e.message}`);
+    state.stackRestartErrors.set(switchEntityId, e.message);
     console.error(e);
   }
   loadActionItems();
