@@ -60,22 +60,12 @@ def _load_token() -> str:
     return os.environ["HA_TOKEN"]
 
 
-def _read_version() -> str:
-    """The app's own version, from the VERSION file baked into the image at
-    build time (see Dockerfile). Without this there was no way -- not from
-    `docker inspect`, not from the app itself -- to ask a *running*
-    container which version it actually was; "latest" and a creation
-    timestamp were the only clues available, which is not a version number.
-    Read once at import time rather than per-request, since it never
-    changes for the life of a running container."""
-    try:
-        with open("VERSION", encoding="utf-8") as f:
-            return f.read().strip()
-    except OSError:
-        return "unknown"
-
-
-APP_VERSION = _read_version()
+APP_VERSION = os.environ.get("APP_VERSION", "unknown")
+# Baked in at build time from the VERSION file (see Dockerfile's
+# ARG VERSION / ENV APP_VERSION). Without this there was no way -- not from
+# `docker inspect`, not from the app itself -- to ask a *running* container
+# which version it actually was; "latest" and a creation timestamp were the
+# only clues available, which is not a version number.
 
 
 HA_DISCOVERY_PORT = 8123
@@ -423,7 +413,8 @@ async def healthz() -> dict[str, str]:
 @app.get("/version")
 async def version() -> dict[str, str]:
     """What version this specific running container actually is -- answers
-    "sudo docker exec ha-portainer-sidecar cat VERSION" or a plain
+    "docker inspect --format '{{ index .Config.Labels
+    \"org.opencontainers.image.version\" }}' ha-portainer-sidecar" or a plain
     `curl http://<host>:8000/version` without needing shell access to the
     container at all. Deliberately separate from /healthz (which also now
     includes it) so a version check reads clearly in logs/monitoring rather

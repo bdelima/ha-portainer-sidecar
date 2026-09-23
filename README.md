@@ -93,6 +93,12 @@ string), then builds and pushes the Docker Hub image tagged with that
 version and `latest`. Nothing else to do by hand -- no separate release
 step, no manual `docker push`.
 
+The built image also carries standard OCI labels (`org.opencontainers.image.version`,
+`.revision`, `.source`, `.url`, `.licenses`), so a running container's exact
+version and build commit are checkable via `docker inspect` even when
+deployed as `:latest` -- or via the app's own `GET /version` endpoint,
+which reads the same version from its `APP_VERSION` env var.
+
 One-time setup this workflow depends on (Docker Hub and GitHub secrets,
 not something a workflow file can do for itself):
 
