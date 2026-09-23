@@ -820,6 +820,13 @@ function renderStaleRows() {
 // each row's button acts immediately on that one endpoint.
 // ---------------------------------------------------------------------
 
+function mibToCompactGb(mib) {
+  if (mib === null || mib === undefined) return null;
+  const gb = mib / 1024;
+  if (gb < 0.05) return "<0.1 GB";
+  return `${gb.toFixed(gb < 10 ? 1 : 0)} GB`;
+}
+
 function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, indent, onClick }) {
   const tr = document.createElement("tr");
   const tdName = document.createElement("td");
@@ -903,26 +910,34 @@ function renderCleanupRows() {
     // Deliberately still wired as dangling=false (the original "Reclaim"
     // call), NOT switched to dangling=true -- this is the one line that
     // will start actually reclaiming every unused image, not just dangling
-    // ones, the moment pyportainer's images_prune() is fixed upstream (see
-    // the pyportainer-images-prune-bug-report.md handed to Bob -- no fix or
-    // report existed yet as of this writing). Leaving the real wiring in
-    // place means that fix requires zero changes on our side to take
-    // effect; only the button's copy needs to catch up today.
+    // ones, the moment pyportainer's images_prune() is fixed upstream.
+    // Leaving the real wiring in place means that fix requires zero changes
+    // on our side to take effect; only the button's copy needs to catch up
+    // today.
     //
-    // No badge here: unused_estimate (images beyond what's running) and
-    // reclaimable_mib (byte-accurate, but across ALL unused images) both
-    // describe a broader scope than this action can actually reach right
-    // now, so showing either next to this specific button would repeat the
-    // exact "pretending we know a number we don't" problem already fixed
-    // once on this tab. unused_estimate still surfaces at the endpoint
-    // header above, as a household-wide "how much is piling up" figure, not
-    // a promise about what pressing this button will remove.
+    // (1.3.4) Tracked at https://github.com/erwindouna/pyportainer/issues/398
+    // -- check there before assuming this is still broken. Filed after the
+    // 1.3.3 release above, not before, so it isn't mentioned there.
+    //
+    // (1.3.4) The unused-image estimate and byte-accurate reclaimable-space
+    // badge stay on this row -- carried over unchanged from the old
+    // "Reclaim all images" row, same figures as before the consolidation.
+    // 1.3.3 actually dropped this badge by mistake when the two actions
+    // were merged; restored here. They describe a broader scope than this
+    // action can currently reach (dangling-only, per the note text below),
+    // which is exactly what that note text is for -- the badge is
+    // informational ("here's how much is piling up"), not a promise about
+    // what THIS press of the button will remove.
+    const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
+    const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
+    const pruneRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+
     const pruneKey = `cleanup-prune-images:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Prune images",
         note: "Removes dangling (untagged, unreferenced) images only. Note that image counts not resetting to 0 is indicative of current API limitations that restrict pruning all unused images. Further pruning would require direct action using the endpoint's Portainer UI.",
-        badgeText: null,
+        badgeText: pruneRowBadge,
         buttonText: "Prune",
         pendingText: "Pruning…",
         pending: isPending(pruneKey),
