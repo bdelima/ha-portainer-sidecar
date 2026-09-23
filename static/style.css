@@ -14,6 +14,28 @@
   --warn: #a15c00;
   --warn-bg: #fff4e0;
   --warn-border: #f0d8a8;
+  /* (1.3.3) A dedicated "info" tone for badges that just surface extra
+     data (an unused-image count, a reclaimable-space figure) rather than
+     a status that needs attention (--warn) or a failure (--danger).
+     Teal, deliberately far from --accent's blue -- these badges sit right
+     next to blue action buttons on the Cleanup tab, and a blue badge next
+     to a blue button reads as one blurred-together element rather than
+     two distinct pieces of information. */
+  --info: #0d6b78;
+  --info-bg: #e3f4f7;
+  --info-border: #bfe3ea;
+  /* (1.3.2) Tab-count badges, colored only once there's actually
+     something to look at (zero stays the neutral --chip-bg pill below).
+     Fixed values rather than swapped in the dark-mode block like --accent/
+     --danger/--warn are -- those get lightened for dark mode to stay
+     legible as plain text on a dark page background, but a lightened
+     --accent/--danger paired with white badge text drops to ~2.8:1 in
+     dark mode, well under WCAG AA. These three are picked specifically to
+     hold >=4.5:1 with white text in both themes, so they stay fixed
+     regardless of theme rather than following the light/dark swap. */
+  --tab-badge-blue: #0b74de; /* Updates -- same as light-mode --accent */
+  --tab-badge-red: #d0342c; /* Trouble -- same as light-mode --danger */
+  --tab-badge-orange: #a15c00; /* Stale/Cleanup -- same as light-mode --warn */
 }
 
 @media (prefers-color-scheme: dark) {
@@ -33,6 +55,9 @@
     --warn: #ffc76b;
     --warn-bg: #3a2e14;
     --warn-border: #5c4a20;
+    --info: #5fd0e0;
+    --info-bg: #10343b;
+    --info-border: #1c525c;
   }
 }
 
@@ -114,7 +139,21 @@ h1 {
   padding: 1px 7px;
   font-size: 0.75rem;
 }
-.tab.active .count { background: var(--accent); color: #fff; }
+/* (1.3.2) Non-zero tab counts get a dedicated color per tab -- a quick
+   visual "go look at this" cue -- regardless of whether that tab happens
+   to be the active one. This replaces the old blanket
+   ".tab.active .count { background: var(--accent) }", which forced every
+   active tab's badge blue even when, say, Trouble was the active tab and
+   its own color is red; the active tab's own highlighting (text color,
+   underline) is untouched below, just no longer paired with a forced
+   badge color. A zero count always keeps the neutral pill above, active
+   or not, per the "nothing to see here" convention the rest of the app
+   already uses. */
+.count.nonzero { color: #fff; }
+.count.nonzero-updates { background: var(--tab-badge-blue); }
+.count.nonzero-trouble { background: var(--tab-badge-red); }
+.count.nonzero-stale,
+.count.nonzero-cleanup { background: var(--tab-badge-orange); }
 
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); }
 
@@ -338,15 +377,23 @@ h1 {
    action (Clean dangling / Reclaim all images / Prune unused volumes).
    Info badges (unused-image estimate, reclaimable space) sit inline next
    to the action's own label rather than in a separate column, since the
-   table's second column is reserved for the row's action button. */
+   table's second column is reserved for the row's action button.
+   (1.3.3) Originally --chip-bg/--text, which is close enough to the
+   surrounding row background and text color that the badge barely read
+   as a separate element -- easy to miss the exact thing it exists to
+   surface. Switched to the --info tokens (a teal, not the --accent blue
+   the row's own action button already uses) so it visibly stands apart
+   from both its background and the nearby button. */
 .cleanup-info-badge {
   display: inline-block;
   margin-left: 8px;
   padding: 1px 8px;
   border-radius: 999px;
   font-size: 0.75rem;
-  color: var(--text);
-  background: var(--chip-bg);
+  font-weight: 600;
+  color: var(--info);
+  background: var(--info-bg);
+  border: 1px solid var(--info-border);
 }
 .cleanup-note {
   color: var(--muted);

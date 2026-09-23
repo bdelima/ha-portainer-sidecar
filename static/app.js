@@ -24,6 +24,22 @@ const state = {
   // name under two different endpoints never collides.
   collapsedEndpoints: new Set(),
   collapsedStacks: new Set(),
+  // (1.3.1) Which actions are currently in flight, by a stable key
+  // ("install:<entity>", "restart-stack:<switchEntityId>", etc). Every
+  // button below is rendered FROM this set on every render() pass, rather
+  // than having its busy/disabled state poked onto a specific DOM node at
+  // click time (the old approach). That distinction matters because
+  // render() runs on every 15s poll regardless of what's in flight --
+  // renderUpdatesRows() in particular rebuilds its whole <tbody> from
+  // scratch every time, which silently discarded any one-off DOM mutation
+  // the moment a poll landed mid-action. A stack-restart-needed install
+  // can run for up to 150s (_await_recreate_outcome's own watch window),
+  // comfortably longer than one 15s poll, so this wasn't a rare edge case
+  // -- any install slow enough to span a poll would visibly "forget" it
+  // was still running and look clickable again. Driving button state from
+  // this set instead means every render(), however triggered, reflects
+  // reality.
+  pendingActions: new Set(),
   // (1.3.1) A failed "Restart Stack Now" gets a persistent inline error on
   // the Trouble tab's stack row, not just a toast -- this is the one action
   // in the whole app where a silent failure is actively misleading (tap it,
@@ -36,6 +52,31 @@ const state = {
 };
 
 const el = (id) => document.getElementById(id);
+
+// See state.pendingActions above for why this exists instead of mutating
+// a button's disabled/text properties directly at click time.
+function isPending(key) {
+  return state.pendingActions.has(key);
+}
+
+// Marks one or more keys pending, runs fn, then clears them -- always,
+// whether fn resolves or throws. Calls render() immediately on entry (so
+// the busy state shows up right away, not just on the next poll) and
+// again on exit. Most callers' fn already ends in loadActionItems(),
+// which calls render() itself, but the render() here still matters: it's
+// what makes the button look busy for the (possibly many seconds)
+// between click and that first server round trip.
+async function runPending(keys, fn) {
+  const keyList = Array.isArray(keys) ? keys : [keys];
+  for (const k of keyList) state.pendingActions.add(k);
+  render();
+  try {
+    await fn();
+  } finally {
+    for (const k of keyList) state.pendingActions.delete(k);
+    render();
+  }
+}
 
 // Valid initial tab from the URL's #fragment, e.g. a stack-restart-needed
 // phone notification links to "<actions_url>#trouble" so tapping it lands
@@ -105,16 +146,31 @@ function pruneStackRestartErrors() {
   }
 }
 
+function setTabCount(id, tabKey, count) {
+  const span = el(id);
+  span.textContent = count;
+  const nonzero = count > 0;
+  span.classList.toggle("nonzero", nonzero);
+  // (1.3.2) Only ever one nonzero-<tab> class active at a time per
+  // badge, but toggle() with a false condition still needs the exact
+  // class name removed -- listing all four and only add-ing the current
+  // tab's keeps a stale color from a previous render (e.g. a hot-reload
+  // during dev) from lingering on the wrong badge.
+  for (const key of ["updates", "trouble", "stale", "cleanup"]) {
+    span.classList.toggle(`nonzero-${key}`, nonzero && key === tabKey);
+  }
+}
+
 function render() {
-  el("count-updates").textContent = state.data.updates.count;
-  el("count-trouble").textContent = state.data.trouble.count;
-  el("count-stale").textContent = state.data.stale.count;
+  setTabCount("count-updates", "updates", state.data.updates.count);
+  setTabCount("count-trouble", "trouble", state.data.trouble.count);
+  setTabCount("count-stale", "stale", state.data.stale.count);
   // (1.3.0) Cleanup's sensor state is a running SUM of the per-endpoint
   // unused-image estimate, not an item count -- see sensor.py's
   // PortainerCleanupCoordinator. Still the right number for the tab
   // badge: "how many unused images across every host," same idea as the
   // other three counts, just not len(items) under the hood.
-  el("count-cleanup").textContent = state.data.cleanup.count;
+  setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
 
   const totalCount =
     state.data.updates.count + state.data.trouble.count + state.data.stale.count + state.data.cleanup.count;
@@ -147,6 +203,27 @@ function emptyRow(colspan, text) {
 // stack_restart_needed items) -- see ha-portainer-dashboard's sensor.py
 // for exactly which fields each sensor's items carry.
 // ---------------------------------------------------------------------
+
+// (fix) How many distinct Portainer endpoints this household actually
+// has, used to decide whether a tab's endpoint level is worth showing at
+// all. Cleanup's own sensor is the one reliable source for this: it
+// carries exactly one item per discovered endpoint, unconditionally,
+// whether or not that endpoint currently has anything to clean up (see
+// PortainerCleanupCoordinator server-side). Updates/Trouble/Stale's own
+// item lists only include an endpoint when it currently has something to
+// report, so using THEIR list length to decide "is this a single-endpoint
+// household" conflates two different questions: "does this household
+// only have one endpoint" (a real reason to collapse the level, since
+// naming a host that's always the only option is just noise) vs "does
+// only one endpoint currently have something wrong" (the endpoint's name
+// is exactly the context that matters there, especially with 3 real
+// endpoints and only one of them in trouble at the moment). Answering the
+// second question with the first one's logic is what hid which host was
+// affected the moment only one endpoint had anything to show on Trouble.
+function knownEndpointCount() {
+  const count = (state.data.cleanup.items || []).length;
+  return count > 0 ? count : 1;
+}
 
 function groupByEndpoint(items) {
   const groups = new Map();
@@ -183,6 +260,34 @@ function groupByStack(items) {
   return { stacks: stackList, direct };
 }
 
+// (1.3.2) Stacks that currently have an open stack_restart_needed
+// Trouble item for the given endpoint, regardless of whether Updates
+// still has any pending item for them. Used to keep a stack's row on the
+// Updates tab visible -- with its warning badge but no children -- even
+// after every one of its containers has been installed, rather than the
+// stack (and the reminder that it still needs a manual restart) just
+// vanishing the moment nothing's left to select. Sourced from Trouble's
+// own item list rather than Updates', since once a stack's updates are
+// all installed, Updates has nothing left carrying that stack's identity
+// at all.
+function stacksAwaitingRestart(troubleItems, endpointKey) {
+  const map = new Map();
+  for (const item of troubleItems) {
+    if (item.kind !== "stack_restart_needed") continue;
+    if ((item.host_device_id || item.host) !== endpointKey) continue;
+    const key = item.stack_device_id || item.stack_name;
+    if (!map.has(key)) {
+      map.set(key, {
+        key,
+        label: item.stack_name,
+        switchEntityId: item.stack_switch_entity_id || item.switch_entity_id || null,
+        items: [],
+      });
+    }
+  }
+  return [...map.values()];
+}
+
 // A tree-header row (endpoint OR stack level) -- an expand/collapse
 // toggle, an optional cascading select-all checkbox, an optional inline
 // badge, and an optional action button (Reload Endpoint / Restart Stack
@@ -198,13 +303,25 @@ function renderGroupHeaderRow({
   expanded,
   onToggleExpand,
   badgeHtml,
-  actionButton, // { text, onClick } | null
+  actionButton, // { text, pendingText, pending, onClick } | null
 }) {
   const tr = document.createElement("tr");
   tr.className = "stack-row";
 
-  const tdCheck = document.createElement("td");
+  // (fix) This cell used to be appended unconditionally, with only its
+  // CONTENTS (the actual <input>) gated on showCheckbox. That's correct
+  // for Updates/Stale, which really do have 3 real columns (checkbox,
+  // name, status) -- but Trouble and Cleanup only declare 2 <th>s each
+  // (no checkbox column exists in their markup at all), so they were
+  // getting an empty phantom cell here PLUS tdName's own colspan=2 right
+  // after it: 3 cells' worth of structure jammed into a 2-column table,
+  // which is what visibly shoved every header row's label out of its
+  // left-aligned position. showCheckbox now decides whether this cell
+  // exists at all, not just whether it has an <input> in it -- every
+  // current caller already passes showCheckbox in lockstep with whether
+  // its target table actually has a checkbox column.
   if (showCheckbox) {
+    const tdCheck = document.createElement("td");
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = checked;
@@ -212,8 +329,8 @@ function renderGroupHeaderRow({
     cb.title = "Select everything under this group";
     cb.addEventListener("change", () => onToggleSelect(cb.checked));
     tdCheck.appendChild(cb);
+    tr.appendChild(tdCheck);
   }
-  tr.appendChild(tdCheck);
 
   const tdName = document.createElement("td");
   tdName.colSpan = 2;
@@ -222,7 +339,10 @@ function renderGroupHeaderRow({
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "stack-toggle";
-  toggle.textContent = `${expanded ? "▾" : "▸"} ${label} (${count})`;
+  // count === null is used for a phantom "still needs attention, nothing
+  // left to select" stack row (see renderUpdatesRows) -- "(0)" there would
+  // read as "nothing wrong" right next to a badge saying otherwise.
+  toggle.textContent = `${expanded ? "▾" : "▸"} ${label}` + (count === null ? "" : ` (${count})`);
   toggle.addEventListener("click", onToggleExpand);
   wrap.appendChild(toggle);
   if (badgeHtml) {
@@ -234,7 +354,8 @@ function renderGroupHeaderRow({
   if (actionButton) {
     const btn = document.createElement("button");
     btn.className = "row-action-btn";
-    btn.textContent = actionButton.text;
+    btn.textContent = actionButton.pending ? actionButton.pendingText || actionButton.text : actionButton.text;
+    btn.disabled = !!actionButton.pending;
     btn.style.marginLeft = "12px";
     btn.style.float = "none";
     btn.addEventListener("click", (ev) => {
@@ -254,8 +375,6 @@ function renderGroupHeaderRow({
 // rather than a fake "Standalone" grouping node.
 // ---------------------------------------------------------------------
 
-const rowInstallButtons = new Map();
-
 function renderUpdateChildRow(item, indentLevel) {
   const tr = document.createElement("tr");
   tr.className = "stack-child-row";
@@ -273,14 +392,15 @@ function renderUpdateChildRow(item, indentLevel) {
   tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
 
   const tdStatus = document.createElement("td");
+  const installKey = `install:${item.entity}`;
+  const installPending = isPending(installKey);
   const installBtn = document.createElement("button");
   installBtn.className = "row-action-btn";
-  installBtn.textContent = "Install";
+  installBtn.textContent = installPending ? "Installing…" : "Install";
+  installBtn.disabled = installPending;
   installBtn.addEventListener("click", () => {
-    const restore = withBusy(installBtn, "Installing…");
-    installUpdates([item.entity]).finally(restore);
+    runPending(installKey, () => installUpdates([item.entity]));
   });
-  rowInstallButtons.set(item.entity, installBtn);
   tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
   tdStatus.appendChild(installBtn);
   if (item.changelog_url) {
@@ -300,19 +420,45 @@ function renderUpdateChildRow(item, indentLevel) {
 function renderUpdatesRows() {
   const tbody = el("rows-updates");
   tbody.innerHTML = "";
-  rowInstallButtons.clear();
   const items = state.data.updates.items || [];
-  if (items.length === 0) {
+  const troubleItems = state.data.trouble.items || [];
+
+  // (1.3.2) Endpoints that have no pending updates left but still have a
+  // stack awaiting a manual restart need a row here too -- otherwise the
+  // household's only remaining "you still need to do something" signal for
+  // that host would live exclusively on the Trouble tab, and the endpoint
+  // would vanish from Updates entirely rather than staying visible with
+  // its phantom, childless stack. Collect every endpoint key that has
+  // either real update items or an awaiting-restart stack.
+  const endpointKeysWithUpdates = new Set(items.map((i) => i.host_device_id || i.host || "__unknown__"));
+  const endpointKeysAwaitingRestart = new Set(
+    troubleItems.filter((i) => i.kind === "stack_restart_needed").map((i) => i.host_device_id || i.host)
+  );
+  const allEndpointKeys = new Set([...endpointKeysWithUpdates, ...endpointKeysAwaitingRestart]);
+
+  if (allEndpointKeys.size === 0) {
     tbody.appendChild(emptyRow(3, "No pending updates."));
     return;
   }
 
   const endpointGroups = groupByEndpoint(items);
-  const singleEndpoint = endpointGroups.length === 1;
+  // Add placeholder endpoint groups for hosts that have an awaiting-restart
+  // stack but zero real update items of their own (all installed already).
+  for (const key of endpointKeysAwaitingRestart) {
+    if (!endpointGroups.some((g) => g.key === key)) {
+      const sample = troubleItems.find(
+        (i) => i.kind === "stack_restart_needed" && (i.host_device_id || i.host) === key
+      );
+      endpointGroups.push({ key, host: sample ? sample.host : "Unknown host", items: [] });
+    }
+  }
+  endpointGroups.sort((a, b) => a.host.localeCompare(b.host));
+  const singleEndpoint = knownEndpointCount() <= 1;
 
   for (const ep of endpointGroups) {
     const epEntities = ep.items.map((i) => i.entity);
     const epExpanded = !state.collapsedEndpoints.has(`updates::${ep.key}`);
+    const phantomStacks = stacksAwaitingRestart(troubleItems, ep.key);
 
     if (!singleEndpoint) {
       tbody.appendChild(
@@ -346,20 +492,35 @@ function renderUpdatesRows() {
     const { stacks, direct } = groupByStack(ep.items);
     const childIndent = singleEndpoint ? 1 : 2;
 
-    for (const stack of stacks) {
+    // (1.3.2) Merge in stacks that have no pending update items left but
+    // still have an open restart-needed Trouble entry -- these render as a
+    // childless row with a permanent badge rather than disappearing the
+    // moment their last update is installed. A stack that still has real
+    // update items handles its own badge via stack_has_open_trouble below,
+    // so it's excluded here to avoid a duplicate row.
+    const realStackKeys = new Set(stacks.map((s) => s.key));
+    const phantomOnly = phantomStacks.filter((s) => !realStackKeys.has(s.key));
+    const allStacks = [...stacks.map((s) => ({ ...s, phantom: false })), ...phantomOnly.map((s) => ({ ...s, phantom: true }))];
+    allStacks.sort((a, b) => a.label.localeCompare(b.label));
+
+    for (const stack of allStacks) {
       const stackKey = `updates::${ep.key}::${stack.key}`;
       const stackEntities = stack.items.map((i) => i.entity);
       const stackExpanded = !state.collapsedStacks.has(stackKey);
-      const hasOpenTrouble = stack.items.some((i) => i.stack_has_open_trouble);
+      const hasOpenTrouble = stack.phantom || stack.items.some((i) => i.stack_has_open_trouble);
 
       tbody.appendChild(
         renderGroupHeaderRow({
           label: stack.label,
-          count: stack.items.length,
+          // A phantom stack has nothing left to count -- "(0)" next to a
+          // "needs remediation" badge would read as "nothing's wrong here"
+          // right beside a warning saying otherwise, so it's omitted.
+          count: stack.phantom ? null : stack.items.length,
           indent: !singleEndpoint,
-          showCheckbox: true,
-          checked: stackEntities.every((id) => state.selection.updates.has(id)),
+          showCheckbox: !stack.phantom,
+          checked: !stack.phantom && stackEntities.every((id) => state.selection.updates.has(id)),
           indeterminate:
+            !stack.phantom &&
             stackEntities.some((id) => state.selection.updates.has(id)) &&
             !stackEntities.every((id) => state.selection.updates.has(id)),
           onToggleSelect: (checked) => {
@@ -378,7 +539,7 @@ function renderUpdatesRows() {
           badgeHtml: hasOpenTrouble ? "⚠ Needs remediation — see Trouble" : null,
         })
       );
-      if (!stackExpanded) continue;
+      if (!stackExpanded || stack.phantom) continue;
       for (const item of stack.items) tbody.appendChild(renderUpdateChildRow(item, childIndent));
     }
 
@@ -469,7 +630,12 @@ function renderTroubleRows() {
   }
   endpointGroups.sort((a, b) => a.host.localeCompare(b.host));
 
-  const singleEndpoint = endpointGroups.length === 1 && endpointItems.length === 0;
+  // The endpointItems.length === 0 carve-out stays regardless of
+  // knownEndpointCount(): when the trouble IS an endpoint being
+  // unreachable, its row already reads "{host} — unreachable", so
+  // collapsing the endpoint level there would delete the one piece of
+  // information ("unreachable") the row exists to show.
+  const singleEndpoint = knownEndpointCount() <= 1 && endpointItems.length === 0;
 
   for (const ep of endpointGroups) {
     const epItem = endpointItems.find((i) => (i.host_device_id || i.host) === ep.key);
@@ -494,10 +660,9 @@ function renderTroubleRows() {
           },
           actionButton: {
             text: "Reload Endpoint",
-            onClick: (btn) => {
-              const restore = withBusy(btn, "Reloading…");
-              reloadEndpoint(ep.key).finally(restore);
-            },
+            pendingText: "Reloading…",
+            pending: isPending(`reload-endpoint:${ep.key}`),
+            onClick: () => runPending(`reload-endpoint:${ep.key}`, () => reloadEndpoint(ep.key)),
           },
         })
       );
@@ -542,10 +707,10 @@ function renderTroubleRows() {
           actionButton: stack.switchEntityId
             ? {
                 text: "Restart Stack Now",
-                onClick: (btn) => {
-                  const restore = withBusy(btn, "Restarting…");
-                  restartStack(stack.switchEntityId).finally(restore);
-                },
+                pendingText: "Restarting…",
+                pending: isPending(`restart-stack:${stack.switchEntityId}`),
+                onClick: () =>
+                  runPending(`restart-stack:${stack.switchEntityId}`, () => restartStack(stack.switchEntityId)),
               }
             : null,
         })
@@ -575,7 +740,7 @@ function renderStaleRows() {
   }
 
   const endpointGroups = groupByEndpoint(items);
-  const singleEndpoint = endpointGroups.length === 1;
+  const singleEndpoint = knownEndpointCount() <= 1;
 
   for (const ep of endpointGroups) {
     const epIds = ep.items.map((i) => staleDeviceId(i)).filter(Boolean);
@@ -661,7 +826,7 @@ function mibToCompactGb(mib) {
   return `${gb.toFixed(gb < 10 ? 1 : 0)} GB`;
 }
 
-function renderCleanupActionRow({ label, note, badgeText, buttonText, indent, onClick }) {
+function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, indent, onClick }) {
   const tr = document.createElement("tr");
   const tdName = document.createElement("td");
   const indentClass = indent ? "row-name-indent" : "";
@@ -674,7 +839,8 @@ function renderCleanupActionRow({ label, note, badgeText, buttonText, indent, on
   const tdAction = document.createElement("td");
   const btn = document.createElement("button");
   btn.className = "row-action-btn";
-  btn.textContent = buttonText;
+  btn.textContent = pending ? pendingText || buttonText : buttonText;
+  btn.disabled = !!pending;
   btn.addEventListener("click", () => onClick(btn));
   tdAction.appendChild(btn);
 
@@ -701,7 +867,16 @@ function renderCleanupRows() {
       tbody.appendChild(
         renderGroupHeaderRow({
           label: ep.host,
-          count: 3,
+          // (fix) This used to be a hardcoded 3 -- the number of action
+          // rows under every endpoint, which is always 3 regardless of
+          // how much there actually is to clean up. That looked exactly
+          // like the "how many things need attention" count every other
+          // tab's header shows, but meant nothing -- every endpoint read
+          // "(3)" no matter what. The real per-endpoint figure is the
+          // same unused-image estimate the "Clean dangling images" row's
+          // own badge already shows; null (unknown/unavailable upstream)
+          // falls back to 0 rather than leaving the header blank.
+          count: ep.unused_estimate ?? 0,
           indent: false,
           showCheckbox: false,
           expanded: epExpanded,
@@ -716,61 +891,73 @@ function renderCleanupRows() {
     }
 
     const indent = !singleEndpoint;
+    // (1.3.2) unused_estimate is images_count - containers_count from
+    // core's own per-endpoint diagnostics -- not an actual dangling-image
+    // count (nothing in HA exposes one). It used to sit on "Clean dangling
+    // images" specifically, which claimed a precision the number doesn't
+    // have: a figure about images beyond what's currently running, badging
+    // an action that only ever touches genuinely untagged/unreferenced
+    // layers. It's shown at the endpoint header (as that endpoint's overall
+    // count) and here, next to Reclaim's own byte-accurate badge, since
+    // "images beyond what's running" is what Reclaim all images actually
+    // acts on -- but never on the dangling-images row, which has no
+    // reliable count to show at all.
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
+    const reclaimRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     // 1. Clean dangling images -- always safe, no confirmation.
+    const danglingKey = `cleanup-dangling:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Clean dangling images",
         note: "Untagged orphan layers only — never referenced by any container, running or stopped.",
-        badgeText: unusedBadge,
+        badgeText: null,
         buttonText: "Clean",
+        pendingText: "Cleaning…",
+        pending: isPending(danglingKey),
         indent,
-        onClick: (btn) => {
-          const restore = withBusy(btn, "Cleaning…");
-          pruneImages(true, null, [ep.device_id]).finally(restore);
-        },
+        onClick: () => runPending(danglingKey, () => pruneImages(true, null, [ep.device_id])),
       })
     );
 
     // 2. Reclaim all images -- no age buffer, confirm dialog.
+    const reclaimKey = `cleanup-reclaim:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Reclaim all images",
         note: "Removes every tagged image with no referencing container, immediately. A container started again afterward just re-pulls its image.",
-        badgeText: reclaimBadge,
+        badgeText: reclaimRowBadge,
         buttonText: "Reclaim",
+        pendingText: "Reclaiming…",
+        pending: isPending(reclaimKey),
         indent,
-        onClick: (btn) => {
+        onClick: () => {
           showConfirmDialog(
             `Remove every unused image on ${ep.host}? This cannot be undone — a container started again afterward will need to re-pull its image.`,
             "Reclaim",
-            () => {
-              const restore = withBusy(btn, "Reclaiming…");
-              pruneImages(false, null, [ep.device_id]).finally(restore);
-            }
+            () => runPending(reclaimKey, () => pruneImages(false, null, [ep.device_id]))
           );
         },
       })
     );
 
     // 3. Prune unused volumes -- courtesy action, confirm dialog.
+    const volumesKey = `cleanup-volumes:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Prune unused volumes",
         note: "Same action as Portainer's own “Prune unused volumes” button — core's Portainer integration gives limited visibility into what's actually unused.",
         badgeText: null,
         buttonText: "Prune",
+        pendingText: "Pruning…",
+        pending: isPending(volumesKey),
         indent,
-        onClick: (btn) => {
+        onClick: () => {
           showConfirmDialog(
             `Remove every unused Docker volume on ${ep.host}? This cannot be undone.`,
             "Prune",
-            () => {
-              const restore = withBusy(btn, "Pruning…");
-              pruneVolumes([ep.device_id]).finally(restore);
-            }
+            () => runPending(volumesKey, () => pruneVolumes([ep.device_id]))
           );
         },
       })
@@ -798,22 +985,23 @@ function renderActionBar() {
   }
   bar.hidden = false;
   el("selection-count").textContent = `${sel.size} selected`;
+  const batchKey = category === "stale" ? "delete-stale-batch" : "install-batch";
+  const pending = isPending(batchKey);
   const btn = el("action-btn");
   btn.className = category === "stale" ? "primary-btn danger" : "primary-btn";
-  btn.textContent = category === "stale" ? `Delete ${sel.size} device(s)` : `Install ${sel.size} update(s)`;
+  btn.disabled = pending;
+  btn.textContent = pending
+    ? category === "stale"
+      ? `Deleting ${sel.size} device(s)…`
+      : `Installing ${sel.size} update(s)…`
+    : category === "stale"
+      ? `Delete ${sel.size} device(s)`
+      : `Install ${sel.size} update(s)`;
   btn.onclick = () => {
     if (category === "stale") confirmDeleteSelected();
     else {
       const ids = [...sel];
-      const restoreBar = withBusy(btn, `Installing ${ids.length} update(s)…`);
-      const restoreRows = ids
-        .map((id) => rowInstallButtons.get(id))
-        .filter(Boolean)
-        .map((rowBtn) => withBusy(rowBtn, "Installing…"));
-      installUpdates(ids).finally(() => {
-        restoreBar();
-        for (const restore of restoreRows) restore();
-      });
+      runPending([batchKey, ...ids.map((id) => `install:${id}`)], () => installUpdates(ids));
     }
   };
 }
@@ -918,7 +1106,7 @@ function confirmDeleteSelected() {
   showConfirmDialog(
     `Permanently delete ${ids.length} stale device${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
     "Delete",
-    () => deleteStaleDevices(ids)
+    () => runPending("delete-stale-batch", () => deleteStaleDevices(ids))
   );
 }
 
@@ -984,23 +1172,6 @@ async function pruneVolumes(deviceIds) {
 }
 
 let toastTimer = null;
-// Every action button (row Install, batch Install, restart/reload/cleanup
-// actions) gets an immediate visual acknowledgement on click -- disables
-// the button and swaps its label to a busy state right away, rather than
-// relying on a toast someone might not be looking at. The caller runs the
-// returned restore function once the action settles (success OR failure);
-// it's a no-op if the button's already gone from the DOM by then, which
-// is exactly what happens on a successful install.
-function withBusy(btn, busyText) {
-  const originalText = btn.textContent;
-  const originalDisabled = btn.disabled;
-  btn.disabled = true;
-  btn.textContent = busyText;
-  return () => {
-    btn.disabled = originalDisabled;
-    btn.textContent = originalText;
-  };
-}
 
 function showToast(text) {
   const toast = el("toast");

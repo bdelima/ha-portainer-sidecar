@@ -241,8 +241,8 @@ async def ha_get_state(entity_id: str) -> dict[str, Any]:
         return resp.json()
 
 
-async def ha_call_service(domain: str, service: str, data: dict[str, Any]) -> None:
-    async with httpx.AsyncClient(timeout=30) as client:
+async def ha_call_service(domain: str, service: str, data: dict[str, Any], timeout: float = 30) -> None:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{HA_BASE_URL}/api/services/{domain}/{service}", headers=HEADERS, json=data
         )
@@ -294,7 +294,7 @@ async def get_action_items() -> dict[str, Any]:
     for key, entity_id in SENSORS.items():
         try:
             state = await ha_get_state(entity_id)
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             raise HTTPException(status_code=502, detail=f"HA request failed for {entity_id}: {exc}") from exc
         raw_state = state.get("state", "0")
         try:
@@ -319,7 +319,7 @@ async def install_updates(payload: InstallRequest) -> dict[str, Any]:
             response = await ha_call_service_with_response(
                 "portainer_maintenance", "perform_update", {"update_entity": entity_id}
             )
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             errors.append({"entity": entity_id, "error": str(exc)})
             continue
         # A phone push already went out from the HA side either way (see
@@ -364,11 +364,35 @@ async def restart_stack(payload: RestartStackRequest) -> dict[str, Any]:
     # after install above, even though we already know a stack needs it.
     # A stack restart bounces every other container in it too, which
     # shouldn't happen without confirmation.
+    #
+    # (fix) 120s, not the default 30s: the integration's own restart_stack
+    # service does a *blocking* switch.turn_off, a 5s settle, then a
+    # blocking switch.turn_on -- and each of those blocking calls waits on
+    # Portainer's own stop-stack/start-stack API call actually completing,
+    # which for a multi-container stack (each container getting Docker's
+    # own SIGTERM grace period before a SIGKILL) can easily run well past
+    # 30s. A confirmed-in-production case: this exact call previously hit
+    # the old 30s timeout and raised on the sidecar side while the restart
+    # was still correctly running to completion on the HA side -- the
+    # stack came back up fine, but the webapp reported a failure it never
+    # actually had.
     try:
         await ha_call_service(
-            "portainer_maintenance", "restart_stack", {"switch_entity_id": payload.switch_entity_id}
+            "portainer_maintenance",
+            "restart_stack",
+            {"switch_entity_id": payload.switch_entity_id},
+            timeout=120,
         )
-    except httpx.HTTPStatusError as exc:
+    except httpx.HTTPError as exc:
+        # (fix) Was `except httpx.HTTPStatusError` -- caught a bad HTTP
+        # response from HA, but not a client-side timeout/connection
+        # error (httpx.TimeoutException, httpx.ConnectError, etc, which
+        # are httpx.RequestError, a sibling of HTTPStatusError under the
+        # common httpx.HTTPError base, not a subclass of it). A timeout
+        # used to propagate as an unhandled exception, which FastAPI turns
+        # into a bare 500 with no detail -- exactly the "flashed an HTTP
+        # 500 for some reason" symptom this was confirmed causing, on a
+        # restart that was itself succeeding server-side the whole time.
         raise HTTPException(status_code=502, detail=f"restart_stack failed: {exc}") from exc
     return {"ok": True}
 
@@ -383,7 +407,7 @@ async def delete_stale_devices(payload: DeleteStaleRequest) -> dict[str, Any]:
     for device_id in payload.device_ids:
         try:
             await ha_call_service("portainer_maintenance", "remove_device", {"device_id": device_id})
-        except httpx.HTTPStatusError as exc:
+        except httpx.HTTPError as exc:
             errors.append({"device_id": device_id, "error": str(exc)})
     return {"attempted": len(payload.device_ids), "errors": errors}
 
@@ -409,7 +433,7 @@ async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
         data["device_ids"] = payload.device_ids
     try:
         await ha_call_service("portainer_maintenance", "prune_images", data)
-    except httpx.HTTPStatusError as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"prune_images failed: {exc}") from exc
     return {"ok": True}
 
@@ -429,7 +453,7 @@ async def prune_volumes(payload: PruneVolumesRequest) -> dict[str, Any]:
         data["device_ids"] = payload.device_ids
     try:
         await ha_call_service("portainer_maintenance", "prune_volumes", data)
-    except httpx.HTTPStatusError as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"prune_volumes failed: {exc}") from exc
     return {"ok": True}
 
@@ -448,7 +472,7 @@ async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
         await ha_call_service(
             "portainer_maintenance", "reload_endpoint", {"device_id": payload.device_id}
         )
-    except httpx.HTTPStatusError as exc:
+    except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"reload_endpoint failed: {exc}") from exc
     return {"ok": True}
 
