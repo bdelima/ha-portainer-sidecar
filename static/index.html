@@ -20,23 +20,8 @@
     <button class="tab active" data-tab="updates">Updates <span class="count" id="count-updates">0</span></button>
     <button class="tab" data-tab="trouble">Trouble <span class="count" id="count-trouble">0</span></button>
     <button class="tab" data-tab="stale">Stale <span class="count" id="count-stale">0</span></button>
+    <button class="tab" data-tab="cleanup">Cleanup <span class="count" id="count-cleanup">0</span></button>
   </nav>
-
-  <div class="maintenance-bar">
-    <span class="maintenance-label">Image cleanup</span>
-    <button id="prune-dangling-btn" class="ghost-btn" title="Removes only untagged orphan layers -- never touches an image any container (running or stopped) still references. Safe to run anytime.">Clean dangling images</button>
-    <button id="prune-unused-btn" class="ghost-btn" title="Removes tagged images with no container referencing them (e.g. from a deleted stack), but only once they've been unused for at least the buffer below -- so a stack you stop and restart shortly after keeps its cached image.">Reclaim unused images</button>
-    <label class="maintenance-hours">
-      older than
-      <input type="number" id="prune-unused-hours" value="48" min="1" step="1">
-      h
-    </label>
-  </div>
-
-  <div id="stack-restart-banner" class="stack-restart-banner" hidden>
-    <div class="stack-restart-header">⚠ Some updates need a stack restart to finish cleanly</div>
-    <div id="stack-restart-list"></div>
-  </div>
 
   <main>
     <div id="empty-state" class="empty-state" hidden>
@@ -61,7 +46,7 @@
       <table class="item-table">
         <thead>
           <tr>
-            <th>Container</th>
+            <th>Item</th>
             <th>Status</th>
           </tr>
         </thead>
@@ -81,6 +66,24 @@
         <tbody id="rows-stale"></tbody>
       </table>
     </section>
+
+    <!-- (1.3.0) Replaced the old always-visible "Image cleanup" toolbar
+         (checkbox-free, un-grouped, always shown above every tab) with a
+         proper 4th tab, tree-grouped by endpoint like the others. No
+         checkbox column at all -- three ordered, per-endpoint action rows
+         (Clean dangling -> Reclaim all images -> Prune unused volumes)
+         with immediate per-row buttons, not a multi-select batch model. -->
+    <section class="panel" data-panel="cleanup" hidden>
+      <table class="item-table">
+        <thead>
+          <tr>
+            <th>Endpoint / action</th>
+            <th>Info</th>
+          </tr>
+        </thead>
+        <tbody id="rows-cleanup"></tbody>
+      </table>
+    </section>
   </main>
 
   <div id="action-bar" class="action-bar" hidden>
@@ -97,7 +100,21 @@
     <p id="confirm-text"></p>
     <div class="dialog-buttons">
       <button id="confirm-cancel" class="ghost-btn">Cancel</button>
-      <button id="confirm-ok" class="danger-btn">Delete</button>
+      <button id="confirm-ok" class="danger-btn">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- (1.3.0) Generic info-only dialog -- used by the Trouble tab's More
+     Info action (an unstacked container stuck on the network_mode:service
+     bug, where there's no remediation to offer, just a fuller explanation
+     than fits in the row's short hint). -->
+<div id="info-dialog" class="dialog-backdrop" hidden>
+  <div class="dialog">
+    <p id="info-title" class="dialog-title"></p>
+    <p id="info-text"></p>
+    <div class="dialog-buttons">
+      <button id="info-close" class="ghost-btn">Close</button>
     </div>
   </div>
 </div>

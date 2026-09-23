@@ -116,36 +116,6 @@ h1 {
 }
 .tab.active .count { background: var(--accent); color: #fff; }
 
-.maintenance-bar {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 8px;
-  margin-bottom: 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--surface);
-}
-.maintenance-label { font-size: 0.8rem; color: var(--muted); margin-right: 4px; }
-.maintenance-hours {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 0.8rem;
-  color: var(--muted);
-  margin-left: auto;
-}
-.maintenance-hours input {
-  width: 48px;
-  padding: 4px 6px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
-  font-size: 0.85rem;
-}
-
 .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: var(--shadow); }
 
 .item-table { width: 100%; border-collapse: collapse; }
@@ -243,6 +213,12 @@ h1 {
 .primary-btn:hover { background: var(--accent-hover); }
 .primary-btn.danger { background: var(--danger); }
 .primary-btn.danger:hover { background: var(--danger-hover); }
+/* Placed after .primary-btn.danger's rules (equal specificity, so source
+   order decides) so a disabled batch-delete/batch-install button also
+   grays out instead of keeping its accent/red background -- matches
+   .row-action-btn:disabled, which is what a singleton row button already
+   does while busy. */
+.primary-btn:disabled { background: var(--muted); cursor: default; opacity: 0.7; }
 
 .ghost-btn {
   background: none;
@@ -283,6 +259,7 @@ h1 {
   box-shadow: var(--shadow);
 }
 .dialog p { margin: 0 0 16px; font-size: 0.95rem; }
+.dialog-title { font-weight: 600; margin-bottom: 8px; }
 .dialog-buttons { display: flex; justify-content: flex-end; gap: 8px; }
 
 .toast {
@@ -315,37 +292,46 @@ h1 {
   text-align: left;
 }
 .row-name-indent { padding-left: 20px; }
+/* (1.3.0) Endpoint -> stack -> container is a 3-level tree on the Updates
+   tab now (was stack -> container, with no endpoint level, before this
+   release) -- this second indent step is for a container row nested
+   under both an endpoint row AND a stack row. */
+.row-name-indent-2 { padding-left: 36px; }
 
-/* Stack-restart-needed banner */
-.stack-restart-banner {
-  margin-bottom: 12px;
-  padding: 10px 12px;
-  border: 1px solid var(--warn-border);
-  border-radius: 8px;
-  background: var(--warn-bg);
-}
-.stack-restart-header {
-  color: var(--warn);
+/* (1.3.0) Stack-level "this stack has an open Trouble item" warning badge
+   on the Updates tab -- reuses the same warn tokens the old stack-restart
+   banner used, just as an inline badge next to the stack's own toggle
+   instead of a separate page element. */
+.trouble-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
   font-weight: 600;
-  font-size: 0.85rem;
-  margin-bottom: 6px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
 }
-.stack-restart-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 6px 0;
-  font-size: 0.85rem;
+
+/* (1.3.0) Cleanup tab -- endpoint header row plus one row per ordered
+   action (Clean dangling / Reclaim all images / Prune unused volumes).
+   Info badges (unused-image estimate, reclaimable space) sit inline next
+   to the action's own label rather than in a separate column, since the
+   table's second column is reserved for the row's action button. */
+.cleanup-info-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  color: var(--text);
+  background: var(--chip-bg);
 }
-.stack-restart-row:not(:last-child) { border-bottom: 1px solid var(--warn-border); }
-.stack-restart-row span { flex: 1; color: var(--text); }
-/* Overrides the generic ".stack-restart-row span" rule above (needs equal
-   specificity via the parent class) so a persisted restart-failure message
-   doesn't compete for space 50/50 with the row's main label. */
-.stack-restart-row .stack-restart-error {
-  flex: 0 1 auto;
-  color: var(--danger);
+.cleanup-note {
+  color: var(--muted);
   font-size: 0.8rem;
+  margin-top: 2px;
 }
 
 [hidden] { display: none !important; }

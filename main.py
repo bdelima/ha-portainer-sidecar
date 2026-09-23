@@ -1,12 +1,12 @@
 """Portainer Sidecar.
 
-A small standalone web app giving a real, multi-select management UI for the
-action items tracked by the Home Assistant Portainer automation set
-(sensor.portainer_updates_pending, sensor.portainer_container_trouble,
-sensor.portainer_stale_devices). Pairs with the "Portainer Maintenance" HA
-custom integration (https://github.com/bdelima/ha-portainer-dashboard),
-which registers a sidebar panel pointing at this app and creates the three
-sensors it reads.
+A small standalone web app giving a real management UI for the action items
+tracked by the Home Assistant Portainer automation set
+(sensor.portainer_updates_pending, sensor.portainer_trouble,
+sensor.portainer_stale_devices, sensor.portainer_cleanup). Pairs with the
+"Portainer Maintenance" HA custom integration
+(https://github.com/bdelima/ha-portainer-dashboard), which registers a
+sidebar panel pointing at this app and creates the four sensors it reads.
 
 Runs as its own container. Holds the HA long-lived access token
 server-side only -- it is never sent to the browser -- and proxies a
@@ -178,8 +178,12 @@ HEADERS = {
 
 SENSORS = {
     "updates": "sensor.portainer_updates_pending",
-    "trouble": "sensor.portainer_container_trouble",
+    # (1.3.0) renamed from sensor.portainer_container_trouble on the
+    # integration side when it grew to cover endpoints and stuck
+    # containers, not just individual container health.
+    "trouble": "sensor.portainer_trouble",
     "stale": "sensor.portainer_stale_devices",
+    "cleanup": "sensor.portainer_cleanup",
 }
 
 app = FastAPI(title="Portainer Sidecar")
@@ -387,21 +391,65 @@ async def delete_stale_devices(payload: DeleteStaleRequest) -> dict[str, Any]:
 class PruneImagesRequest(BaseModel):
     dangling: bool = False
     until_hours: int | None = None
+    # (1.3.0) targets a single endpoint's Cleanup-tab row instead of
+    # always fanning out to every discovered host.
+    device_ids: list[str] | None = None
 
 
 @app.post("/api/actions/prune-images")
 async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
     # Delegates to portainer_maintenance.prune_images (HA side), which
     # discovers every Portainer endpoint device on its own via the device
-    # registry and calls the core portainer.prune_images action once per
-    # host -- this app never needs to know host/device_ids itself.
+    # registry (or targets exactly the given device_ids) and calls the
+    # core portainer.prune_images action once per host.
     data: dict[str, Any] = {"dangling": payload.dangling}
     if payload.until_hours is not None:
         data["until_hours"] = payload.until_hours
+    if payload.device_ids:
+        data["device_ids"] = payload.device_ids
     try:
         await ha_call_service("portainer_maintenance", "prune_images", data)
     except httpx.HTTPStatusError as exc:
         raise HTTPException(status_code=502, detail=f"prune_images failed: {exc}") from exc
+    return {"ok": True}
+
+
+class PruneVolumesRequest(BaseModel):
+    device_ids: list[str] | None = None
+
+
+@app.post("/api/actions/prune-volumes")
+async def prune_volumes(payload: PruneVolumesRequest) -> dict[str, Any]:
+    """(1.3.0, new) Delegates to portainer_maintenance.prune_volumes, which
+    presses the button.*_volumes_prune entity for each targeted (or every
+    discovered) endpoint -- see that service's own description for why a
+    button.press wrapper, not a dedicated core service that doesn't exist."""
+    data: dict[str, Any] = {}
+    if payload.device_ids:
+        data["device_ids"] = payload.device_ids
+    try:
+        await ha_call_service("portainer_maintenance", "prune_volumes", data)
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"prune_volumes failed: {exc}") from exc
+    return {"ok": True}
+
+
+class ReloadEndpointRequest(BaseModel):
+    device_id: str
+
+
+@app.post("/api/actions/reload-endpoint")
+async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
+    """(1.3.0, new) Reloads the core portainer config entry that owns the
+    given endpoint device -- the Trouble tab's remediation for an endpoint
+    that's dropped its connection, the same reload Settings -> Devices &
+    Services -> Portainer -> Reload performs from HA's own UI."""
+    try:
+        await ha_call_service(
+            "portainer_maintenance", "reload_endpoint", {"device_id": payload.device_id}
+        )
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"reload_endpoint failed: {exc}") from exc
     return {"ok": True}
 
 
