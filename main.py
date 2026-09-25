@@ -42,6 +42,9 @@ import asyncio
 import ipaddress
 import os
 import socket
+import time
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -306,38 +309,181 @@ async def get_action_items() -> dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------
+# Update jobs (1.3.5) -- one job per selected update, queued
+# per-Portainer-endpoint, tracked independently, and polled for status
+# instead of one blocking request processing the whole batch.
+#
+# The old /api/actions/install handled a whole multi-select batch inside a
+# single HTTP request: a plain `for` loop awaited each perform_update call
+# in turn before starting the next, all on the one connection the browser
+# opened when the batch was submitted. That connection's lifetime scaled
+# with the size (and luck) of the batch -- a big batch, or one slow item,
+# could keep it open for minutes -- and it was that one long-lived
+# connection, not "too many concurrent updates" (nothing here has ever
+# sent Portainer more than one recreate at a time), that a reverse proxy
+# or browser timeout would kill, reporting the *entire* batch as failed
+# even while the server-side loop was still correctly working through it.
+#
+# Now: submitting a batch creates one job per update and returns almost
+# immediately with a job id for each. Jobs are queued one-per-Portainer-
+# endpoint (see _run_endpoint_queue) -- two endpoints' batches run
+# concurrently since they're on separate queues, but within a single
+# endpoint updates still go out strictly one at a time, since that's what's
+# actually safe for its Docker daemon/Portainer agent to receive. Each
+# job's own timeout (ha_call_service_with_response's 180s httpx timeout)
+# is freshly scoped starting only when that job actually begins running --
+# not when the batch was submitted, and not shifted by how many other jobs
+# happened to be queued ahead of it on its endpoint.
+JOB_RETENTION_SECONDS = 900
+# How long a finished job's status stays queryable after it completes --
+# long enough for a slow poller (or a page reload mid-batch) to still see
+# the final outcome, short enough this dict never grows unbounded on a
+# container that stays up for weeks.
+
+
+@dataclass
+class UpdateJob:
+    id: str
+    entity_id: str
+    endpoint_key: str
+    status: str = "queued"  # queued -> running -> succeeded | failed | timed_out
+    queued_at: float = field(default_factory=time.monotonic)
+    started_at: float | None = None
+    finished_at: float | None = None
+    error: str | None = None
+    needs_stack_restart: bool = False
+    stack_switch_entity_id: str | None = None
+
+
+JOBS: dict[str, UpdateJob] = {}
+_ENDPOINT_QUEUES: dict[str, "asyncio.Queue[str]"] = {}
+_ENDPOINT_WORKERS: dict[str, asyncio.Task] = {}
+
+
+def _get_endpoint_queue(endpoint_key: str) -> "asyncio.Queue[str]":
+    queue = _ENDPOINT_QUEUES.get(endpoint_key)
+    if queue is None:
+        queue = asyncio.Queue()
+        _ENDPOINT_QUEUES[endpoint_key] = queue
+        # One long-lived worker per endpoint, created the first time that
+        # endpoint is seen and kept running for the life of the process --
+        # not spawned per batch, so a second batch against an endpoint
+        # that's still working through its first one just appends to the
+        # same queue instead of racing it.
+        _ENDPOINT_WORKERS[endpoint_key] = asyncio.create_task(_run_endpoint_queue(endpoint_key))
+    return queue
+
+
+async def _run_endpoint_queue(endpoint_key: str) -> None:
+    queue = _ENDPOINT_QUEUES[endpoint_key]
+    while True:
+        job_id = await queue.get()
+        job = JOBS.get(job_id)
+        if job is not None:
+            await _run_job(job)
+        queue.task_done()
+
+
+async def _run_job(job: UpdateJob) -> None:
+    job.status = "running"
+    job.started_at = time.monotonic()
+    try:
+        response = await ha_call_service_with_response(
+            "portainer_maintenance", "perform_update", {"update_entity": job.entity_id}
+        )
+        job.needs_stack_restart = bool(response.get("needs_stack_restart"))
+        job.stack_switch_entity_id = response.get("stack_switch_entity_id")
+        job.status = "succeeded"
+    except httpx.TimeoutException as exc:
+        job.status = "timed_out"
+        job.error = str(exc)
+    except httpx.HTTPError as exc:
+        job.status = "failed"
+        job.error = str(exc)
+    except Exception as exc:
+        # Anything else (an empty or non-JSON 200 from HA, a null/list
+        # service_response, ...). Must be caught here: this runs inside the
+        # endpoint's single long-lived worker, and an exception escaping it
+        # would end that worker for good -- the job stuck "running", every
+        # later job for that endpoint stuck "queued" until the container
+        # restarts. (CancelledError is a BaseException and still propagates.)
+        job.status = "failed"
+        job.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        job.finished_at = time.monotonic()
+
+
+def _prune_old_jobs() -> None:
+    now = time.monotonic()
+    stale = [
+        job_id
+        for job_id, job in JOBS.items()
+        if job.finished_at is not None and (now - job.finished_at) > JOB_RETENTION_SECONDS
+    ]
+    for job_id in stale:
+        del JOBS[job_id]
+
+
+class InstallJobRequest(BaseModel):
+    entity_id: str
+    # Which Portainer endpoint this update belongs to, used only to route
+    # it onto that endpoint's own queue -- an opaque grouping key from the
+    # frontend's own endpoint tree (host_device_id when known, else the
+    # host name), not something this backend resolves itself. Updates that
+    # don't carry one (or share the same fallback) simply queue together.
+    endpoint_key: str = "_default"
+
+
 class InstallRequest(BaseModel):
-    update_entities: list[str]
+    updates: list[InstallJobRequest]
 
 
 @app.post("/api/actions/install")
 async def install_updates(payload: InstallRequest) -> dict[str, Any]:
-    errors = []
-    needs_stack_restart = []
-    for entity_id in payload.update_entities:
-        try:
-            response = await ha_call_service_with_response(
-                "portainer_maintenance", "perform_update", {"update_entity": entity_id}
-            )
-        except httpx.HTTPError as exc:
-            errors.append({"entity": entity_id, "error": str(exc)})
-            continue
-        # A phone push already went out from the HA side either way (see
-        # perform_update's own docstring) -- this is additive, so whoever's
-        # sitting at the dashboard right now doesn't have to go find their
-        # phone to notice a stack needs restarting.
-        if response.get("needs_stack_restart"):
-            needs_stack_restart.append(
+    _prune_old_jobs()
+    job_ids = []
+    for item in payload.updates:
+        job = UpdateJob(id=str(uuid.uuid4()), entity_id=item.entity_id, endpoint_key=item.endpoint_key)
+        JOBS[job.id] = job
+        _get_endpoint_queue(item.endpoint_key).put_nowait(job.id)
+        job_ids.append(job.id)
+    return {"job_ids": job_ids}
+
+
+@app.get("/api/actions/install/status")
+async def install_status(job_ids: str) -> dict[str, Any]:
+    ids = [j for j in job_ids.split(",") if j]
+    jobs = []
+    for job_id in ids:
+        job = JOBS.get(job_id)
+        if job is None:
+            # Already pruned, or the app restarted since this job was
+            # submitted -- report it distinctly from a real failure so the
+            # frontend can say so rather than implying the update itself
+            # errored out.
+            jobs.append(
                 {
-                    "entity": entity_id,
-                    "stack_switch_entity_id": response.get("stack_switch_entity_id"),
+                    "id": job_id,
+                    "entity_id": None,
+                    "status": "unknown",
+                    "error": "Job not found (may have expired, or the app restarted)",
+                    "needs_stack_restart": False,
+                    "stack_switch_entity_id": None,
                 }
             )
-    return {
-        "attempted": len(payload.update_entities),
-        "errors": errors,
-        "needs_stack_restart": needs_stack_restart,
-    }
+            continue
+        jobs.append(
+            {
+                "id": job.id,
+                "entity_id": job.entity_id,
+                "status": job.status,
+                "error": job.error,
+                "needs_stack_restart": job.needs_stack_restart,
+                "stack_switch_entity_id": job.stack_switch_entity_id,
+            }
+        )
+    return {"jobs": jobs}
 
 
 class RestartStackRequest(BaseModel):

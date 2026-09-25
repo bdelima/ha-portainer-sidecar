@@ -1029,31 +1029,123 @@ function selectAll(category, checked) {
   render();
 }
 
+// (1.3.5) Install used to be one blocking POST that processed the
+// whole selected batch sequentially inside a single HTTP request -- a big
+// batch, or one slow item in it, could hold that one connection open for
+// minutes, at the mercy of whatever reverse proxy or browser timeout sits
+// in front of this app. That's what actually broke a large non-stack
+// batch reported in the field: not "too many concurrent updates" (nothing
+// here has ever sent Portainer more than one recreate at a time), but one
+// long-lived request outliving an unrelated timeout somewhere upstream,
+// which then reported the *entire* batch as failed even while the
+// server-side loop was still correctly working through it.
+//
+// Now: submit the batch, get a job id per update back almost immediately,
+// then poll for status. The backend queues jobs one-per-Portainer-endpoint
+// (see main.py's _run_endpoint_queue) -- a batch spanning multiple
+// endpoints runs those endpoints concurrently, but a single endpoint's
+// updates still go out strictly one at a time, same as before. Each row's
+// "Installing…" state clears the moment ITS OWN job resolves, not when the
+// slowest job in the whole batch finally does.
+const INSTALL_POLL_INTERVAL_MS = 2000;
+const INSTALL_POLL_MAX_MS = 20 * 60 * 1000;
+// 20 minutes -- comfortably longer than any legitimate job (a pull+recreate,
+// plus up to the integration's own 150s stack-restart-detection watch for a
+// stack member), short enough that a job stuck behind a dead endpoint
+// worker doesn't leave this tab polling forever.
+
+function endpointKeyForUpdateEntity(entityId) {
+  const item = (state.data.updates.items || []).find((i) => i.entity === entityId);
+  return (item && (item.host_device_id || item.host)) || "__unknown__";
+}
+
 async function installUpdates(entityIds) {
   if (entityIds.length === 0) return;
   showToast(`Installing ${entityIds.length} update(s)…`);
+
+  let jobIds;
   try {
     const res = await fetch("/api/actions/install", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ update_entities: entityIds }),
+      body: JSON.stringify({
+        updates: entityIds.map((id) => ({ entity_id: id, endpoint_key: endpointKeyForUpdateEntity(id) })),
+      }),
     });
-    const result = await res.json();
-    for (const id of entityIds) state.selection.updates.delete(id);
-    if (result.errors && result.errors.length > 0) {
-      showToast(`Done with ${result.errors.length} error(s) — check backend logs`);
-    } else if (result.needs_stack_restart && result.needs_stack_restart.length > 0) {
-      // (1.3.0) No persistent banner -- a one-time toast pointing at the
-      // Trouble tab, which is where the actual remediation now lives (see
-      // renderTroubleRows above). Trouble picks this up on its own next
-      // poll without anything special needed here.
-      showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Trouble tab`);
-    } else {
-      showToast(`Installed ${entityIds.length} update(s)`);
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    ({ job_ids: jobIds } = await res.json());
   } catch (e) {
-    showToast("Install failed — see console");
+    showToast("Install failed to submit — see console");
     console.error(e);
+    loadActionItems();
+    return;
+  }
+
+  // job_ids comes back in the same order entityIds was submitted in.
+  const jobs = jobIds.map((jobId, i) => ({ jobId, entityId: entityIds[i], done: false }));
+  const errors = [];
+  const timedOut = [];
+  const needsStackRestart = [];
+  const deadline = Date.now() + INSTALL_POLL_MAX_MS;
+
+  while (jobs.some((j) => !j.done) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, INSTALL_POLL_INTERVAL_MS));
+    const pendingIds = jobs.filter((j) => !j.done).map((j) => j.jobId);
+    if (pendingIds.length === 0) break;
+    let statusResult;
+    try {
+      const res = await fetch(`/api/actions/install/status?job_ids=${encodeURIComponent(pendingIds.join(","))}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      statusResult = await res.json();
+    } catch (e) {
+      // A poll failing doesn't mean the jobs themselves failed -- keep
+      // trying on the next tick rather than giving up on jobs that may
+      // well still be progressing server-side.
+      console.error(e);
+      continue;
+    }
+    for (const s of statusResult.jobs || []) {
+      const job = jobs.find((j) => j.jobId === s.id);
+      if (!job || job.done || s.status === "queued" || s.status === "running") continue;
+      job.done = true;
+      state.selection.updates.delete(job.entityId);
+      state.pendingActions.delete(`install:${job.entityId}`);
+      if (s.status === "succeeded") {
+        if (s.needs_stack_restart) needsStackRestart.push(job.entityId);
+      } else if (s.status === "timed_out") {
+        timedOut.push(job.entityId);
+      } else {
+        errors.push(job.entityId);
+      }
+      render();
+    }
+  }
+
+  // Anything still not done at this point hit the client-side poll cap --
+  // clear its busy state too rather than leaving the row stuck on
+  // "Installing…" forever; its outcome is unknown from here, not a
+  // confirmed failure, but there's nothing more productive to wait for.
+  for (const job of jobs) {
+    if (job.done) continue;
+    job.done = true;
+    state.selection.updates.delete(job.entityId);
+    state.pendingActions.delete(`install:${job.entityId}`);
+    timedOut.push(job.entityId);
+  }
+
+  if (errors.length > 0 || timedOut.length > 0) {
+    const parts = [];
+    if (errors.length > 0) parts.push(`${errors.length} error(s)`);
+    if (timedOut.length > 0) parts.push(`${timedOut.length} timed out`);
+    showToast(`Done with ${parts.join(", ")} — check backend logs`);
+  } else if (needsStackRestart.length > 0) {
+    // (1.3.0) No persistent banner -- a one-time toast pointing at the
+    // Trouble tab, which is where the actual remediation now lives (see
+    // renderTroubleRows above). Trouble picks this up on its own next
+    // poll without anything special needed here.
+    showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Trouble tab`);
+  } else {
+    showToast(`Installed ${entityIds.length} update(s)`);
   }
   loadActionItems();
 }
