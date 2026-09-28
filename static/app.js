@@ -53,38 +53,45 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
-// (1.3.6) Every "open in a new tab" link in this app (changelog, history,
+// (1.3.7) Every "open in a new tab" link in this app (changelog, history,
 // device page) is a plain <a target="_blank" rel="noopener">, which works
 // fine in a real browser but can silently do nothing when this app is
 // rendered inside Home Assistant's iOS/Android companion app -- their
-// embedded webview (WKWebView on iOS defaults javaScriptCanOpenWindowsAutomatically
-// to false) commonly disallows window.open()-style popup creation
+// embedded webview commonly disallows window.open()-style popup creation
 // entirely unless the host app explicitly wires up a delegate for it,
 // which is exactly what a target="_blank" anchor click triggers under the
 // hood. Reported specifically for the changelog link (an external
-// github.com/hub.docker.com URL) -- worth wiring every such link the same
-// way rather than just that one, since they all share the failure mode.
+// github.com/hub.docker.com URL); all three "new tab" links share the
+// same underlying element, so all three are wired through here.
 //
-// The fix takes over the click by hand: try window.open() first (works
-// identically to the native target="_blank" behavior in a real browser,
-// same new-tab result), and only if that call returns null/undefined --
-// which is exactly what happens when a webview disallows popup creation,
-// not a guess -- fall back to a plain top-level navigation instead. The
-// companion apps are specifically known to intercept a *navigation*
-// attempt (as opposed to a popup/new-window attempt) to a host that isn't
-// the connected Home Assistant instance and hand it off to the system
-// browser, so that fallback is what should actually make the link work
-// there, at the cost of navigating the current view instead of opening a
-// second tab -- a fallback that only ever engages when the popup was
-// already blocked, so a normal browser's experience (a real new tab) is
-// unaffected.
+// (1.3.6, reverted) The first attempt at this fell back to
+// `window.location.href = anchor.href` when window.open() came back
+// falsy, on the theory that the companion apps intercept a top-level
+// navigation attempt and hand it to the system browser. That was wrong,
+// and actively harmful: this app is itself served inside an iframe (the
+// integration's own sidebar panel), so `window` here is the IFRAME's
+// window, not the tab/webview's top-level one -- the fallback navigated
+// the panel's own iframe to github.com, and github.com correctly refuses
+// to be framed by anything (X-Frame-Options/CSP), so the panel just broke
+// with a "refused to connect" page in place of the dashboard, in both a
+// real browser and the companion app. There's no reliable way from inside
+// a nested, sandboxed webview to tell "navigate this window" apart from
+// "break the view the user is looking at", so this no longer gambles on
+// it. window.open() still gets tried -- it's a real new-tab/new-window
+// request, not a same-frame navigation, so it can never clobber this
+// app's own view even when it fails -- and if that's blocked, the URL is
+// copied to the clipboard (falling back to just naming it in the toast)
+// instead of navigating anywhere.
 function wireExternalLink(anchor) {
   anchor.addEventListener("click", (event) => {
     event.preventDefault();
     const popup = window.open(anchor.href, "_blank", "noopener");
-    if (!popup) {
-      window.location.href = anchor.href;
-    }
+    if (popup) return;
+    navigator.clipboard
+      ?.writeText(anchor.href)
+      .then(() => showToast("Couldn't open automatically — link copied to clipboard"))
+      .catch(() => showToast(`Couldn't open automatically — ${anchor.href}`));
+    if (!navigator.clipboard) showToast(`Couldn't open automatically — ${anchor.href}`);
   });
   return anchor;
 }
