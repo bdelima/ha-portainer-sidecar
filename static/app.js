@@ -53,6 +53,42 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+// (1.3.6) Every "open in a new tab" link in this app (changelog, history,
+// device page) is a plain <a target="_blank" rel="noopener">, which works
+// fine in a real browser but can silently do nothing when this app is
+// rendered inside Home Assistant's iOS/Android companion app -- their
+// embedded webview (WKWebView on iOS defaults javaScriptCanOpenWindowsAutomatically
+// to false) commonly disallows window.open()-style popup creation
+// entirely unless the host app explicitly wires up a delegate for it,
+// which is exactly what a target="_blank" anchor click triggers under the
+// hood. Reported specifically for the changelog link (an external
+// github.com/hub.docker.com URL) -- worth wiring every such link the same
+// way rather than just that one, since they all share the failure mode.
+//
+// The fix takes over the click by hand: try window.open() first (works
+// identically to the native target="_blank" behavior in a real browser,
+// same new-tab result), and only if that call returns null/undefined --
+// which is exactly what happens when a webview disallows popup creation,
+// not a guess -- fall back to a plain top-level navigation instead. The
+// companion apps are specifically known to intercept a *navigation*
+// attempt (as opposed to a popup/new-window attempt) to a host that isn't
+// the connected Home Assistant instance and hand it off to the system
+// browser, so that fallback is what should actually make the link work
+// there, at the cost of navigating the current view instead of opening a
+// second tab -- a fallback that only ever engages when the popup was
+// already blocked, so a normal browser's experience (a real new tab) is
+// unaffected.
+function wireExternalLink(anchor) {
+  anchor.addEventListener("click", (event) => {
+    event.preventDefault();
+    const popup = window.open(anchor.href, "_blank", "noopener");
+    if (!popup) {
+      window.location.href = anchor.href;
+    }
+  });
+  return anchor;
+}
+
 // See state.pendingActions above for why this exists instead of mutating
 // a button's disabled/text properties directly at click time.
 function isPending(key) {
@@ -410,6 +446,7 @@ function renderUpdateChildRow(item, indentLevel) {
     changelogLink.target = "_blank";
     changelogLink.rel = "noopener";
     changelogLink.textContent = "Changelog";
+    wireExternalLink(changelogLink);
     tdStatus.appendChild(changelogLink);
   }
 
@@ -565,7 +602,7 @@ function troubleViewLink(item) {
   link.className = "row-action-btn";
   link.style.textDecoration = "none";
   link.textContent = "View";
-  return link;
+  return wireExternalLink(link);
 }
 
 // (1.3.1) Persistent inline error under a stack's header row after a
@@ -802,6 +839,7 @@ function renderStaleRows() {
         link.className = "row-action-btn";
         link.style.textDecoration = "none";
         link.textContent = "Review";
+        wireExternalLink(link);
         tdStatus.appendChild(link);
       }
 
