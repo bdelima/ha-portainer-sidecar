@@ -119,6 +119,42 @@
   </div>
 </div>
 
+<!-- (1.3.8) Last-resort fallback for a "new tab" link that window.open()
+     couldn't open (the Home Assistant companion app's embedded webview) --
+     a toast alone isn't enough here since a bare URL in a 4s-then-gone
+     toast gives the person nothing they can actually act on. A readonly,
+     auto-selected input can always be copied by hand (long-press -> Copy)
+     even where navigator.clipboard itself isn't available, which is
+     exactly the case this exists for. -->
+<div id="link-dialog" class="dialog-backdrop" hidden>
+  <div class="dialog">
+    <p id="link-dialog-title" class="dialog-title">Couldn't open this automatically</p>
+    <p id="link-dialog-text" class="muted"></p>
+    <input id="link-dialog-url" type="text" readonly class="link-dialog-input">
+    <div class="dialog-buttons">
+      <button id="link-dialog-close" class="ghost-btn">Close</button>
+      <button id="link-dialog-copy" class="primary-btn">Copy link</button>
+    </div>
+  </div>
+</div>
+
+<!-- (1.3.8) Renders a repo's release notes in-app -- fetched and
+     cached server-side via GitHub's API (see main.py's /api/changelog),
+     see showChangelogDialog in app.js. This is what actually closes the
+     "changelog doesn't work in the companion app" saga: nothing here
+     opens a new window, so there's nothing for that webview to block. -->
+<div id="changelog-dialog" class="dialog-backdrop" hidden>
+  <div class="dialog changelog-dialog">
+    <p id="changelog-dialog-title" class="dialog-title"></p>
+    <p id="changelog-dialog-meta" class="muted"></p>
+    <div id="changelog-dialog-body" class="changelog-body"></div>
+    <div class="dialog-buttons">
+      <a id="changelog-dialog-view" class="ghost-btn changelog-view-link" target="_blank" rel="noopener" hidden>View on GitHub</a>
+      <button id="changelog-dialog-close" class="primary-btn">Close</button>
+    </div>
+  </div>
+</div>
+
 <div id="toast" class="toast" hidden></div>
 
 <script src="app.js"></script>

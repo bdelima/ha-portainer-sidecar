@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
+import re
 import socket
 import time
 import uuid
@@ -621,6 +622,84 @@ async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"reload_endpoint failed: {exc}") from exc
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------
+# Changelog (1.3.8) -- fetches a repo's latest GitHub release notes
+# server-side and serves them from this app's own origin, so the frontend
+# can render them in-app instead of linking out to github.com. Two earlier
+# attempts (1.3.6, 1.3.7) tried to make the external link itself work from
+# Home Assistant's companion app -- its embedded webview won't open a new
+# window, and a same-window fallback can only navigate this app's own
+# iframe, clobbering the panel it's rendered in when the destination
+# (correctly) refuses to be framed. Serving our own copy of the content
+# sidesteps the whole problem: nothing needs to open a new window, and
+# there's no cross-origin framing question since it's this app's own
+# origin either way.
+CHANGELOG_CACHE_TTL_SECONDS = 3600
+# GitHub's unauthenticated API allows 60 requests/hour per IP. Caching
+# each repo's result here for an hour -- server-side, shared across every
+# browser/tab that asks -- keeps this comfortably under that regardless of
+# how often any one person reloads the page.
+_CHANGELOG_CACHE: dict[str, tuple[float, dict[str, Any] | None]] = {}
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
+
+
+async def _fetch_github_release(repo: str) -> dict[str, Any] | None:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        # GitHub's API rejects requests with no User-Agent at all.
+        "User-Agent": "ha-portainer-sidecar",
+    }
+    async with httpx.AsyncClient(timeout=10, headers=headers) as client:
+        resp = await client.get(f"https://api.github.com/repos/{repo}/releases/latest")
+        if resp.status_code == 404:
+            # /releases/latest only ever returns a non-prerelease, non-draft
+            # release -- a repo that only ever cuts prereleases (or hasn't
+            # marked one "latest" yet) 404s here even though it does have
+            # releases. Fall back to the newest release of any kind before
+            # concluding there's nothing to show.
+            resp = await client.get(f"https://api.github.com/repos/{repo}/releases?per_page=1")
+            if resp.status_code != 200:
+                return None
+            releases = resp.json()
+            if not releases:
+                return None
+            data = releases[0]
+        elif resp.status_code == 200:
+            data = resp.json()
+        else:
+            return None
+    return {
+        "repo": repo,
+        "tag_name": data.get("tag_name"),
+        "name": data.get("name") or data.get("tag_name"),
+        "published_at": data.get("published_at"),
+        "body": data.get("body") or "",
+        "html_url": data.get("html_url"),
+        "prerelease": bool(data.get("prerelease")),
+    }
+
+
+@app.get("/api/changelog/{repo:path}")
+async def get_changelog(repo: str) -> dict[str, Any]:
+    if not _REPO_SLUG_RE.match(repo):
+        raise HTTPException(status_code=400, detail="repo must look like owner/name")
+
+    now = time.monotonic()
+    cached = _CHANGELOG_CACHE.get(repo)
+    if cached is not None and (now - cached[0]) < CHANGELOG_CACHE_TTL_SECONDS:
+        release = cached[1]
+    else:
+        try:
+            release = await _fetch_github_release(repo)
+        except httpx.HTTPError:
+            release = None
+        _CHANGELOG_CACHE[repo] = (now, release)
+
+    if release is None:
+        raise HTTPException(status_code=404, detail=f"No release notes found for {repo}")
+    return release
 
 
 @app.get("/healthz")

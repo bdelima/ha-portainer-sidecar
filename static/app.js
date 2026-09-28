@@ -79,21 +79,189 @@ const el = (id) => document.getElementById(id);
 // "break the view the user is looking at", so this no longer gambles on
 // it. window.open() still gets tried -- it's a real new-tab/new-window
 // request, not a same-frame navigation, so it can never clobber this
-// app's own view even when it fails -- and if that's blocked, the URL is
-// copied to the clipboard (falling back to just naming it in the toast)
-// instead of navigating anywhere.
+// app's own view even when it fails.
+//
+// (1.3.7, superseded) When window.open() was blocked, this tried
+// navigator.clipboard.writeText() and showed a toast either way. In the
+// companion app that API itself turned out to be unavailable (most likely
+// because a webview doesn't expose Clipboard-write permissions to
+// embedded iframe content, or the panel isn't served over a secure
+// context there) -- so the fallback's own fallback fired, dumping the raw
+// URL into a toast that auto-dismisses after 4 seconds with no way to
+// actually select or copy it. Confirmed, not a guess: reported directly
+// after 1.3.7 shipped.
+//
+// (1.3.8) Never assume the Clipboard API is there -- still try it as a
+// convenience (showLinkDialog's Copy button), but the real fallback is a
+// dialog with the URL in a plain readonly <input>. That can always be
+// selected and copied by hand (long-press -> Copy on mobile, click-drag +
+// Ctrl/Cmd-C on desktop), because that's native text selection, not the
+// Clipboard API -- it works even where navigator.clipboard doesn't, and
+// it doesn't disappear after 4 seconds.
+function openExternal(url) {
+  const popup = window.open(url, "_blank", "noopener");
+  if (!popup) showLinkDialog(url);
+}
+
+// Assignment (.onclick =), not addEventListener -- this gets called on
+// freshly-created row anchors (fine either way) but also on the
+// changelog dialog's persistent "View on GitHub" button, which is
+// re-wired every time a changelog opens rather than recreated. Assignment
+// replaces the previous handler; addEventListener would silently stack a
+// new one on every open, firing openExternal() multiple times per click
+// after a few uses.
 function wireExternalLink(anchor) {
-  anchor.addEventListener("click", (event) => {
+  anchor.onclick = (event) => {
     event.preventDefault();
-    const popup = window.open(anchor.href, "_blank", "noopener");
-    if (popup) return;
-    navigator.clipboard
-      ?.writeText(anchor.href)
-      .then(() => showToast("Couldn't open automatically — link copied to clipboard"))
-      .catch(() => showToast(`Couldn't open automatically — ${anchor.href}`));
-    if (!navigator.clipboard) showToast(`Couldn't open automatically — ${anchor.href}`);
-  });
+    openExternal(anchor.href);
+  };
   return anchor;
+}
+
+function showLinkDialog(url) {
+  const input = el("link-dialog-url");
+  el("link-dialog-text").textContent =
+    "This couldn't be opened automatically here. Copy the link below to open it yourself:";
+  input.value = url;
+  el("link-dialog").hidden = false;
+  input.focus();
+  input.select();
+  el("link-dialog-copy").onclick = () => {
+    navigator.clipboard
+      ?.writeText(url)
+      .then(() => showToast("Link copied to clipboard"))
+      .catch(() => {
+        input.focus();
+        input.select();
+      });
+    if (!navigator.clipboard) {
+      input.focus();
+      input.select();
+    }
+  };
+  el("link-dialog-close").onclick = () => {
+    el("link-dialog").hidden = true;
+  };
+}
+
+// ---------------------------------------------------------------------
+// Changelog (1.3.8) -- renders a repo's latest GitHub release notes
+// in-app instead of linking out to github.com. This is what finally
+// closes the "changelog link doesn't work in the companion app" saga:
+// nothing here opens a new window at all, so there's nothing for that
+// webview to block. The backend (main.py's /api/changelog/{repo}) fetches
+// and caches the release via GitHub's API; this just renders the result.
+//
+// renderMarkdownSafe is deliberately small, not a real CommonMark parser
+// -- it covers what GitHub's own auto-generated release notes and most
+// hand-written ones actually use (headings, bold/italic, inline code,
+// bullet lists, markdown links, and bare URLs) and nothing more. Safety
+// comes from ordering: the ENTIRE input is HTML-escaped first via
+// escapeHtml, and every tag this function itself introduces afterward is
+// one it built, with hrefs restricted to http(s) URLs. escapeHtml (below)
+// escapes &/</> via a textContent round-trip but deliberately leaves `"`
+// and `'` alone, since those aren't meaningful in HTML *text* content --
+// which is exactly wrong for a value about to be spliced into an
+// attribute. A release body containing a bare URL like
+// `https://x/"onmouseover="alert(1)` would otherwise close the href
+// attribute early and inject a live event-handler attribute onto the
+// element -- confirmed, not a hypothetical, while reviewing this before
+// it shipped. escapeAttr (below) additionally escapes quote characters
+// for every href this function builds, so nothing extracted from the body
+// can break out of the attribute it's placed in, however it's shaped.
+function escapeAttr(str) {
+  return str.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+function inlineMarkdown(text) {
+  let out = text
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => `<a href="${escapeAttr(url)}" target="_blank" rel="noopener">${label}</a>`)
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, "$1<em>$2</em>");
+  // Bare URLs (common in GitHub's auto-generated notes -- "in
+  // https://github.com/x/y/pull/123", not markdown [text](url) syntax) --
+  // skipped when already inside an href="..." from the replace above.
+  out = out.replace(/(?<!href=")(https?:\/\/[^\s<]+)/g, (match) => {
+    const trimmed = match.replace(/[).,\]>"']+$/, "");
+    const trailing = match.slice(trimmed.length);
+    return `<a href="${escapeAttr(trimmed)}" target="_blank" rel="noopener">${trimmed}</a>${trailing}`;
+  });
+  return out;
+}
+
+function renderMarkdownSafe(markdown) {
+  const escaped = escapeHtml(markdown || "");
+  const lines = escaped.split("\n");
+  const htmlLines = [];
+  let inList = false;
+  const closeList = () => {
+    if (inList) {
+      htmlLines.push("</ul>");
+      inList = false;
+    }
+  };
+  for (const line of lines) {
+    const headerMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    const bulletMatch = line.match(/^[-*]\s+(.*)$/);
+    if (headerMatch) {
+      closeList();
+      const level = Math.min(headerMatch[1].length, 4) + 1; // h2..h5 -- h1 is the dialog title
+      htmlLines.push(`<h${level}>${inlineMarkdown(headerMatch[2])}</h${level}>`);
+    } else if (bulletMatch) {
+      if (!inList) {
+        htmlLines.push("<ul>");
+        inList = true;
+      }
+      htmlLines.push(`<li>${inlineMarkdown(bulletMatch[1])}</li>`);
+    } else if (line.trim() === "") {
+      closeList();
+    } else {
+      closeList();
+      htmlLines.push(`<p>${inlineMarkdown(line)}</p>`);
+    }
+  }
+  closeList();
+  return htmlLines.join("\n");
+}
+
+async function showChangelogDialog(repo) {
+  el("changelog-dialog-title").textContent = repo;
+  el("changelog-dialog-meta").textContent = "Loading…";
+  el("changelog-dialog-body").innerHTML = "";
+  el("changelog-dialog-view").hidden = true;
+  el("changelog-dialog").hidden = false;
+  el("changelog-dialog-close").onclick = () => {
+    el("changelog-dialog").hidden = true;
+  };
+
+  let release;
+  try {
+    const res = await fetch(`/api/changelog/${encodeURIComponent(repo)}`);
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      el("changelog-dialog-meta").textContent = body.detail || `Couldn't load release notes (HTTP ${res.status}).`;
+      return;
+    }
+    release = await res.json();
+  } catch (e) {
+    el("changelog-dialog-meta").textContent = "Couldn't load release notes — see console.";
+    console.error(e);
+    return;
+  }
+
+  const when = release.published_at ? new Date(release.published_at).toLocaleDateString() : null;
+  el("changelog-dialog-title").textContent = `${repo} — ${release.name || release.tag_name || "latest release"}`;
+  el("changelog-dialog-meta").textContent = [release.prerelease ? "Pre-release" : null, when].filter(Boolean).join(" · ");
+  el("changelog-dialog-body").innerHTML =
+    renderMarkdownSafe(release.body) || '<p class="muted">No description provided for this release.</p>';
+  for (const a of el("changelog-dialog-body").querySelectorAll('a[target="_blank"]')) wireExternalLink(a);
+  if (release.html_url) {
+    const viewLink = el("changelog-dialog-view");
+    viewLink.href = release.html_url;
+    viewLink.hidden = false;
+    wireExternalLink(viewLink);
+  }
 }
 
 // See state.pendingActions above for why this exists instead of mutating
@@ -446,7 +614,19 @@ function renderUpdateChildRow(item, indentLevel) {
   });
   tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
   tdStatus.appendChild(installBtn);
-  if (item.changelog_url) {
+  if (item.changelog_repo) {
+    // (1.3.8) Renders release notes in-app (see showChangelogDialog) --
+    // a plain in-page button, not a link, since nothing here opens a new
+    // window at all. Needs a dashboard integration new enough to expose
+    // changelog_repo; an older one (or a hand-curated override that isn't
+    // a github.com URL) only has changelog_url, handled below instead.
+    const changelogBtn = document.createElement("button");
+    changelogBtn.type = "button";
+    changelogBtn.className = "row-changelog-link row-changelog-btn";
+    changelogBtn.textContent = "Changelog";
+    changelogBtn.addEventListener("click", () => showChangelogDialog(item.changelog_repo));
+    tdStatus.appendChild(changelogBtn);
+  } else if (item.changelog_url) {
     const changelogLink = document.createElement("a");
     changelogLink.className = "row-changelog-link";
     changelogLink.href = item.changelog_url;
