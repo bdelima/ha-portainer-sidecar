@@ -98,9 +98,35 @@ const el = (id) => document.getElementById(id);
 // Ctrl/Cmd-C on desktop), because that's native text selection, not the
 // Clipboard API -- it works even where navigator.clipboard doesn't, and
 // it doesn't disappear after 4 seconds.
+// (fix) window.open()'s third argument used to be the literal string
+// "noopener" -- a WINDOW FEATURES string, not a rel token. Passing ANY
+// non-empty features string (even this one) is what tells some browsers
+// and mobile WebViews "this is a popup window, not a plain new tab," which
+// routes it through stricter blocking than a bare `_blank` target does.
+// The anchors themselves already carry rel="noopener" for native
+// navigation, so there's nothing this call needs the features string for
+// -- dropped it, and null out .opener directly on the returned window
+// instead for the cases where this function opens one itself.
+//
+// (fix) A user who isn't sure the first tap registered (no visible
+// feedback while a new tab opens in the background) tends to tap again.
+// If the first tap's popup succeeded, Chrome's "only one program-opened
+// popup per gesture" heuristic can then block the SECOND tap's
+// window.open() and report it as failed -- which used to pop the "couldn't
+// open automatically" dialog even though the link had, in fact, already
+// opened a moment earlier. EXTERNAL_OPEN_DEBOUNCE_MS makes a second
+// invocation for the same URL within a short window a no-op instead of a
+// second real attempt.
+const EXTERNAL_OPEN_DEBOUNCE_MS = 1500;
+let lastExternalOpen = { url: null, at: 0 };
+
 function openExternal(url) {
-  const popup = window.open(url, "_blank", "noopener");
-  if (!popup) showLinkDialog(url);
+  const now = Date.now();
+  if (lastExternalOpen.url === url && now - lastExternalOpen.at < EXTERNAL_OPEN_DEBOUNCE_MS) return;
+  lastExternalOpen = { url, at: now };
+  const popup = window.open(url, "_blank");
+  if (popup) popup.opener = null;
+  else showLinkDialog(url);
 }
 
 // Assignment (.onclick =), not addEventListener -- this gets called on
@@ -118,7 +144,22 @@ function wireExternalLink(anchor) {
   return anchor;
 }
 
+// (fix) Every dialog on this page is an independent, always-in-the-DOM
+// overlay that only toggles its own `hidden` -- nothing ever closed one
+// dialog when another opened, so it was possible to end up with two
+// stacked at once (e.g. a link inside the still-open changelog dialog
+// falling back to the link-dialog): the top one showing, and the other
+// sitting hidden-in-plain-sight underneath until the first was dismissed.
+// Closing every OTHER dialog before showing a new one keeps this a strict
+// one-at-a-time UI regardless of which combination of dialogs a given
+// sequence of clicks happens to trigger.
+const DIALOG_IDS = ["confirm-dialog", "info-dialog", "link-dialog", "changelog-dialog"];
+function hideAllDialogs() {
+  for (const id of DIALOG_IDS) el(id).hidden = true;
+}
+
 function showLinkDialog(url) {
+  hideAllDialogs();
   const input = el("link-dialog-url");
   el("link-dialog-text").textContent =
     "This couldn't be opened automatically here. Copy the link below to open it yourself:";
@@ -169,8 +210,59 @@ function showLinkDialog(url) {
 // it shipped. escapeAttr (below) additionally escapes quote characters
 // for every href this function builds, so nothing extracted from the body
 // can break out of the attribute it's placed in, however it's shaped.
+// restoreEscapedEntities (below) runs after escapeHtml and before any of
+// this function's own tag-building -- it only ever turns an
+// already-escaped, allowlisted entity back into a real one (e.g.
+// "&amp;nbsp;" -> "&nbsp;", a space once rendered), which is inert text,
+// never new markup, so it doesn't reopen anything escapeHtml closed.
 function escapeAttr(str) {
   return str.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// (fix) A release body can contain literal HTML character entities as
+// plain text -- &nbsp; showed up in a real one (dozzle's) -- most likely
+// pasted in from somewhere that used them for layout. escapeHtml above
+// turns the leading & into &amp;, so without this step the browser shows
+// the literal text "&nbsp;" instead of the space the author intended.
+// This restores a small allowlist of named entities (plus any numeric
+// reference, e.g. &#39; or &#x27; -- always safe, since a numeric
+// reference can only ever decode to a single character and never
+// introduces markup) back to real entities so the browser decodes them
+// normally. Safe because it can only restore an entity that was ALREADY
+// present as literal text in the untrusted source: "&amp;nbsp;" back to
+// "&nbsp;" is a space once rendered, never a new tag or attribute -- an
+// entity not on the allowlist (or not a valid entity at all) is left
+// exactly as escapeHtml produced it.
+// `quot` and `apos` are deliberately NOT on this list, and neither should
+// ever be added -- found in review before this shipped: every href this
+// file builds goes through escapeAttr(), which only matches a literal `"`/
+// `'` CHARACTER, not the six-character text "&quot;"/"&apos;". A release
+// body containing that literal text as part of a bare URL --
+// `https://x/&quot;onmouseover=&quot;alert(1)` -- passes through
+// escapeAttr() completely unescaped (there's no raw quote character for it
+// to find), and once restored to `&quot;` here, the BROWSER's own
+// attribute-value parser decodes it back into a real `"` while parsing
+// `href="..."`, closing the attribute early and turning
+// ` onmouseover=&quot;alert(1)` into a live event-handler attribute on the
+// same tag -- confirmed against the actual code path, not a guess; this is
+// the identical attribute-breakout class escapeAttr() exists to prevent,
+// reached through entity syntax instead of a raw quote character.
+// Everything below decodes to a character that cannot terminate a
+// double-quoted attribute or re-enter the tokenizer as markup (decoded
+// `<`/`>`/`&` are inert literal characters in whatever context -- text or
+// attribute -- they land in, never new tag/attribute boundaries).
+const RESTORABLE_HTML_ENTITIES = new Set([
+  "nbsp", "amp", "lt", "gt", "cent", "pound", "yen", "euro",
+  "copy", "reg", "trade", "deg", "plusmn", "times", "divide", "micro",
+  "para", "middot", "laquo", "raquo", "iexcl", "iquest", "sect", "hellip",
+  "mdash", "ndash", "lsquo", "rsquo", "ldquo", "rdquo", "bull", "dagger",
+  "permil", "larr", "rarr", "uarr", "darr", "harr",
+]);
+function restoreEscapedEntities(text) {
+  return text.replace(/&amp;(#[0-9]+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{0,31});/g, (match, ent) => {
+    if (ent[0] === "#") return `&${ent};`;
+    return RESTORABLE_HTML_ENTITIES.has(ent.toLowerCase()) ? `&${ent};` : match;
+  });
 }
 
 function inlineMarkdown(text) {
@@ -191,7 +283,7 @@ function inlineMarkdown(text) {
 }
 
 function renderMarkdownSafe(markdown) {
-  const escaped = escapeHtml(markdown || "");
+  const escaped = restoreEscapedEntities(escapeHtml(markdown || ""));
   const lines = escaped.split("\n");
   const htmlLines = [];
   let inList = false;
@@ -226,6 +318,7 @@ function renderMarkdownSafe(markdown) {
 }
 
 async function showChangelogDialog(repo) {
+  hideAllDialogs();
   el("changelog-dialog-title").textContent = repo;
   el("changelog-dialog-meta").textContent = "Loading…";
   el("changelog-dialog-body").innerHTML = "";
@@ -1509,6 +1602,7 @@ function showToast(text) {
 }
 
 function showConfirmDialog(text, confirmLabel, onConfirm) {
+  hideAllDialogs();
   el("confirm-text").textContent = text;
   el("confirm-ok").textContent = confirmLabel;
   el("confirm-dialog").hidden = false;
@@ -1522,6 +1616,7 @@ function showConfirmDialog(text, confirmLabel, onConfirm) {
 }
 
 function showInfoDialog(title, text) {
+  hideAllDialogs();
   el("info-title").textContent = title;
   el("info-text").textContent = text;
   el("info-dialog").hidden = false;
