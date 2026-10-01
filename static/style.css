@@ -107,8 +107,15 @@ h1 {
 }
 .icon-btn:hover { background: var(--row-hover); }
 
+/* (1.3.10) Wraps to a second row instead of overflowing/forcing a
+   horizontal scroll when all four tabs don't fit a narrow portrait-phone
+   width -- content-driven (wraps whenever it doesn't fit) rather than
+   gated on an orientation media query, so it also covers split-screen,
+   tablets, and any future fifth tab without needing a width tuned by
+   hand. Landscape and desktop already fit on one line and are unaffected. */
 .tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   margin-bottom: 12px;
   border-bottom: 1px solid var(--border);
