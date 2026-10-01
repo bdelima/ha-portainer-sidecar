@@ -853,7 +853,7 @@ function renderUpdatesRows() {
             else state.collapsedStacks.delete(stackKey);
             render();
           },
-          badgeHtml: hasOpenTrouble ? "⚠ Needs remediation — see Trouble" : null,
+          badgeHtml: hasOpenTrouble ? "⚠ See Needs Remediation tab" : null,
         })
       );
       if (!stackExpanded || stack.phantom) continue;
@@ -1461,7 +1461,7 @@ async function installUpdates(entityIds) {
     // Trouble tab, which is where the actual remediation now lives (see
     // renderTroubleRows above). Trouble picks this up on its own next
     // poll without anything special needed here.
-    showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Trouble tab`);
+    showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
   } else {
     showToast(`Installed ${entityIds.length} update(s)`);
   }
