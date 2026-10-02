@@ -388,6 +388,14 @@ async function runPending(keys, fn) {
 // left last time.
 function tabFromHash() {
   const hash = (location.hash || "").replace(/^#/, "");
+  // (1.3.12) '#needs-remediation' is the new deep-link hash used by the
+  // dashboard integration's trouble notification (matching the Trouble
+  // tab's display-only rename to 'Needs Remediation' in 1.3.11); the
+  // internal tab id stays 'trouble' (see templates above), so this just
+  // aliases the new hash onto the existing tab rather than renaming
+  // anything else. '#trouble' keeps working for any older notification
+  // already in a phone's tray or any other existing link.
+  if (hash === "needs-remediation") return "trouble";
   return ["updates", "trouble", "stale", "cleanup"].includes(hash) ? hash : null;
 }
 
