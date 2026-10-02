@@ -121,6 +121,27 @@ h1 {
   border-bottom: 1px solid var(--border);
 }
 
+/* (1.3.11) On a narrow portrait phone, the plain flex-wrap above was
+   content-driven -- it packed as many tabs as fit on the first row, which
+   with "Needs Remediation" now the longest label meant 3 tabs on top and
+   a single lonely "Cleanup" stranded on its own row underneath. Below
+   this width, force an even 2x2 grid instead: predictable regardless of
+   label length or a future fifth tab pushing the count to an odd number
+   (a trailing tab just spans both columns on its own row rather than
+   reflowing unevenly). The breakpoint is a typical phone-portrait width,
+   not content-measured, since centering this specifically on the 4-tab
+   case is the point -- landscape/tablet/desktop keep the one-line flex
+   layout above untouched. */
+@media (max-width: 480px) {
+  .tabs {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .tab {
+    justify-content: center;
+  }
+}
+
 .tab {
   background: none;
   border: none;
