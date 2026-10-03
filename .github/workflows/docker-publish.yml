@@ -53,15 +53,6 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create tag and GitHub Release
-        if: steps.check.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ steps.version.outputs.version }}" \
-            --title "${{ steps.version.outputs.version }}" \
-            --generate-notes
-
       - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
         if: steps.check.outputs.exists == 'false'
 
@@ -86,3 +77,16 @@ jobs:
           tags: |
             bdelima/ha-portainer-sidecar:${{ steps.version.outputs.version }}
             bdelima/ha-portainer-sidecar:latest
+
+      - name: Create tag and GitHub Release
+        # Created LAST, after the image is built and pushed: a failed build then never
+        # leaves a tag/GitHub release with no image behind it (and a re-run of the
+        # same version still works, because no tag exists yet).
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.version }}" \
+            --title "${{ steps.version.outputs.version }}" \
+            --generate-notes
+
