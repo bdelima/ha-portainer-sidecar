@@ -33,6 +33,7 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    environment: release
     outputs:
       version: ${{ steps.version.outputs.version }}
       created: ${{ steps.check.outputs.exists == 'false' }}
