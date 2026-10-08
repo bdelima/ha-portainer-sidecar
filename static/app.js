@@ -1475,6 +1475,34 @@ function orderPortainerLast(entityIds) {
   ];
 }
 
+// Home Assistant's own update goes after everything else in a batch, and
+// only once every other job -- on every endpoint -- has finished. Recreating
+// the homeassistant container restarts the thing that is running the
+// install (perform_update is a service call into HA), so anything still
+// queued or running behind it would be cut off. The backend's per-endpoint
+// queues run concurrently across endpoints, so submit order alone can't
+// guarantee this; the batch is split into two submissions instead.
+// Matched by container name (homeassistant / home-assistant / home_assistant)
+// or by the update's changelog repo, because the update item carries no
+// image field.
+function isHomeAssistantOwnUpdate(entityId) {
+  const item = (state.data.updates.items || []).find((i) => i.entity === entityId);
+  if (!item) return false;
+  if (String(item.changelog_repo || "").toLowerCase() === "home-assistant/core") return true;
+  if (!item.name) return false;
+  const name = item.name.replace(/\s*\([^)]*\)\s*$/, "").trim().toLowerCase();
+  return name === "homeassistant" || name === "home-assistant" || name === "home_assistant";
+}
+
+// Splits a batch into submission groups, in the order they must run:
+// everything else first (Portainer's own update last within it), then Home
+// Assistant. Empty groups are dropped.
+function installGroups(entityIds) {
+  const ha = entityIds.filter((id) => isHomeAssistantOwnUpdate(id));
+  const rest = orderPortainerLast(entityIds.filter((id) => !isHomeAssistantOwnUpdate(id)));
+  return [rest, ha].filter((g) => g.length > 0);
+}
+
 // Short, single-line version of a backend job error for the row's status
 // text. The full text stays available as the row's tooltip.
 function shortInstallError(err) {
@@ -1512,11 +1540,11 @@ function installResultFromJob(job) {
   return { kind: "failed", message: `Failed — ${shortInstallError(job.error)}`, detail: job.error || "", at };
 }
 
-async function installUpdates(entityIds) {
-  if (entityIds.length === 0) return;
-  entityIds = orderPortainerLast(entityIds);
-  for (const id of entityIds) state.installResults.delete(id);
-  showToast(`Installing ${entityIds.length} update(s)…`);
+// Submits one group of updates and polls it to completion. Returns the
+// outcome lists so installUpdates can report one summary for the whole
+// batch (which may be several groups run back to back).
+async function runInstallGroup(entityIds) {
+  const outcome = { errors: [], timedOut: [], needsStackRestart: [], submitFailed: false };
 
   let jobIds;
   try {
@@ -1532,15 +1560,18 @@ async function installUpdates(entityIds) {
   } catch (e) {
     showToast("Install failed to submit — see console");
     console.error(e);
+    // Nothing was submitted, so these rows are not installing: clear their
+    // busy state rather than leaving them stuck on "Installing…".
+    for (const id of entityIds) state.pendingActions.delete(`install:${id}`);
+    render();
     loadActionItems();
-    return;
+    outcome.submitFailed = true;
+    return outcome;
   }
 
   // job_ids comes back in the same order entityIds was submitted in.
   const jobs = jobIds.map((jobId, i) => ({ jobId, entityId: entityIds[i], done: false }));
-  const errors = [];
-  const timedOut = [];
-  const needsStackRestart = [];
+  const { errors, timedOut, needsStackRestart } = outcome;
   const deadline = Date.now() + INSTALL_POLL_MAX_MS;
 
   while (jobs.some((j) => !j.done) && Date.now() < deadline) {
@@ -1602,6 +1633,41 @@ async function installUpdates(entityIds) {
     timedOut.push(job.entityId);
   }
 
+  return outcome;
+}
+
+async function installUpdates(entityIds) {
+  if (entityIds.length === 0) return;
+  const groups = installGroups(entityIds);
+  const ordered = groups.flat();
+  for (const id of ordered) state.installResults.delete(id);
+  showToast(`Installing ${ordered.length} update(s)…`);
+
+  const errors = [];
+  const timedOut = [];
+  const needsStackRestart = [];
+  let submitFailed = false;
+  for (const [n, group] of groups.entries()) {
+    if (n > 0) {
+      showToast(
+        group.length === 1 && isHomeAssistantOwnUpdate(group[0])
+          ? "Everything else is done — installing Home Assistant last…"
+          : `Installing ${group.length} more update(s)…`,
+      );
+    }
+    const outcome = await runInstallGroup(group);
+    errors.push(...outcome.errors);
+    timedOut.push(...outcome.timedOut);
+    needsStackRestart.push(...outcome.needsStackRestart);
+    if (outcome.submitFailed) submitFailed = true;
+  }
+
+  // A group that failed to submit has already toasted that; don't overwrite
+  // it with a misleading "Installed N" summary.
+  if (submitFailed && errors.length === 0 && timedOut.length === 0) {
+    loadActionItems();
+    return;
+  }
   if (errors.length > 0 || timedOut.length > 0) {
     const parts = [];
     if (errors.length > 0) parts.push(`${errors.length} error(s)`);
@@ -1612,9 +1678,9 @@ async function installUpdates(entityIds) {
     // Trouble tab, which is where the actual remediation now lives (see
     // renderTroubleRows above). Trouble picks this up on its own next
     // poll without anything special needed here.
-    showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
+    showToast(`Installed ${ordered.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
   } else {
-    showToast(`Installed ${entityIds.length} update(s)`);
+    showToast(`Installed ${ordered.length} update(s)`);
   }
   loadActionItems();
 }
