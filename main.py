@@ -36,14 +36,18 @@ Environment variables:
                      it. Pass it via an env file / Docker secret (or
                      HA_TOKEN_FILE, below), never bake it into the image.
     AUTH_USERNAME,
-    AUTH_PASSWORD   Sign-in for this app's own web UI. Set both, and every
-                     request needs a session (see "Authentication" below).
-                     The Portainer Maintenance integration's setup form takes
-                     the same pair so its sidebar panel signs in by itself.
+    AUTH_PASSWORD   Optional. Sign-in for this app's own web UI. Set both, and
+                     every request needs a session (see "Authentication"
+                     below). The Portainer Maintenance integration's setup form
+                     takes the same pair so its sidebar panel signs in by
+                     itself. With neither set (and AUTH_ALLOW_ANONYMOUS unset)
+                     the app is open to anyone who can reach it, as in earlier
+                     versions.
     AUTH_ALLOW_ANONYMOUS
-                     Set to true to turn authentication off entirely (for
-                     testing). With neither the pair above nor this set, the
-                     app refuses to serve anything but /healthz and /version.
+                     Optional. true: no sign-in at all, even if the pair above
+                     is set. false: refuse to serve unless the pair is set.
+                     Unset: open when no pair is set, sign-in required when
+                     both are.
 """
 from __future__ import annotations
 
@@ -211,12 +215,16 @@ app = FastAPI(title="Portainer Sidecar")
 # Authentication
 #
 # Three modes, picked from the environment (see _auth_mode):
-#   anonymous  AUTH_ALLOW_ANONYMOUS=true. No checks at all (testing).
+#   anonymous  No checks at all. This is the default when nothing is
+#              configured, so an install keeps working exactly as it did before
+#              sign-in existed, and also what AUTH_ALLOW_ANONYMOUS=true gives
+#              (which wins even over a username/password pair).
 #   required   AUTH_USERNAME and AUTH_PASSWORD both set. Every request except
 #              /healthz, /version and /login needs a valid session cookie.
-#   locked     anything else. Nothing is served except /healthz and /version,
-#              so an install that has not been given credentials fails closed
-#              instead of silently staying open.
+#   locked     A misconfiguration: only one of the pair set, or
+#              AUTH_ALLOW_ANONYMOUS=false with no pair. Nothing is served
+#              except /healthz and /version, with a message saying what to fix.
+#              Better to refuse than to guess which way the owner meant it.
 #
 # A session is a stateless signed cookie, so there is nothing to store: it is
 # "<expiry>.<HMAC>", keyed from the password, so changing the password signs
@@ -238,7 +246,12 @@ def _truthy(value: str | None) -> bool:
 
 AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "")
 AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
-AUTH_ALLOW_ANONYMOUS = _truthy(os.environ.get("AUTH_ALLOW_ANONYMOUS"))
+# None = not set (or blank), True/False = set explicitly.
+AUTH_ALLOW_ANONYMOUS: bool | None = (
+    _truthy(os.environ["AUTH_ALLOW_ANONYMOUS"])
+    if os.environ.get("AUTH_ALLOW_ANONYMOUS", "").strip()
+    else None
+)
 
 SESSION_COOKIE = "sidecar_session"
 SESSION_MAX_AGE = 30 * 24 * 3600
@@ -257,7 +270,11 @@ def _auth_mode() -> str:
         return "anonymous"
     if AUTH_USERNAME and AUTH_PASSWORD:
         return "required"
-    return "locked"
+    if AUTH_USERNAME or AUTH_PASSWORD:
+        return "locked"  # only one of the pair
+    if AUTH_ALLOW_ANONYMOUS is None:
+        return "anonymous"  # nothing configured: open, as before sign-in existed
+    return "locked"  # AUTH_ALLOW_ANONYMOUS=false but no credentials to require
 
 
 def _locked_message() -> str:
@@ -267,9 +284,10 @@ def _locked_message() -> str:
             "must both be set."
         )
     return (
-        "Authentication is not configured. Set AUTH_USERNAME and AUTH_PASSWORD "
-        "in this container's environment (or AUTH_ALLOW_ANONYMOUS=true to "
-        "allow unauthenticated access), then restart it."
+        "AUTH_ALLOW_ANONYMOUS is false but no sign-in is configured. Set "
+        "AUTH_USERNAME and AUTH_PASSWORD in this container's environment, or "
+        "remove AUTH_ALLOW_ANONYMOUS (or set it to true) to allow "
+        "unauthenticated access, then restart it."
     )
 
 
@@ -445,8 +463,13 @@ async def _auth_gate(request: Request, call_next):
 @app.on_event("startup")
 async def _log_auth_mode() -> None:
     mode = _auth_mode()
-    if mode == "anonymous":
-        print("[startup] AUTH_ALLOW_ANONYMOUS is set: this app is serving WITHOUT authentication")
+    if mode == "anonymous" and AUTH_ALLOW_ANONYMOUS:
+        print("[startup] AUTH_ALLOW_ANONYMOUS is true: this app is serving WITHOUT authentication")
+    elif mode == "anonymous":
+        print(
+            "[startup] No sign-in configured: this app is serving WITHOUT authentication. "
+            "Set AUTH_USERNAME and AUTH_PASSWORD to require one."
+        )
     elif mode == "locked":
         print(f"[startup] ERROR: {_locked_message()} Serving only /healthz and /version.")
     else:
@@ -788,12 +811,13 @@ class RestartStackRequest(BaseModel):
     @field_validator("switch_entity_id")
     @classmethod
     def _must_be_a_switch_entity(cls, value: str) -> str:
-        # This app has no auth of its own (see README "Security"), same as
-        # every other endpoint here -- this isn't a security boundary, just
-        # a cheap sanity check against a stray non-switch entity_id (e.g. a
-        # typo, or a stale value from state.stackRestartEntries) reaching
-        # the portainer_maintenance.restart_stack service, which itself
-        # just does cv.entity_id and would happily stop/start whatever
+        # Not a security boundary (whether this endpoint needs a sign-in is
+        # decided by the auth gate near the top of this file, see README
+        # "Authentication"), just a cheap sanity check against a stray
+        # non-switch entity_id (e.g. a typo, or a stale value from
+        # state.stackRestartEntries) reaching the
+        # portainer_maintenance.restart_stack service, which itself just
+        # does cv.entity_id and would happily stop/start whatever
         # entity_id it's handed.
         if not value.startswith("switch."):
             raise ValueError("switch_entity_id must be a switch.* entity")
