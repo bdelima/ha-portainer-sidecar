@@ -1176,7 +1176,10 @@ function mibToCompactGb(mib) {
   return `${gb.toFixed(gb < 10 ? 1 : 0)} GB`;
 }
 
-function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, indent, onClick }) {
+// `pending` is this row's own action running (its button reads pendingText);
+// `disabled` additionally greys the button out without changing its text, for
+// when a different action on the same endpoint is running.
+function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, disabled, indent, onClick }) {
   const tr = document.createElement("tr");
   const tdName = document.createElement("td");
   const indentClass = indent ? "row-name-indent" : "";
@@ -1190,7 +1193,7 @@ function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingTex
   const btn = document.createElement("button");
   btn.className = "row-action-btn";
   btn.textContent = pending ? pendingText || buttonText : buttonText;
-  btn.disabled = !!pending;
+  btn.disabled = !!(pending || disabled);
   btn.addEventListener("click", () => onClick(btn));
   tdAction.appendChild(btn);
 
@@ -1282,14 +1285,26 @@ function renderCleanupRows() {
     const pruneRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     const pruneKey = `cleanup-prune-images:${ep.device_id}`;
+    const volumesKey = `cleanup-volumes:${ep.device_id}`;
+    // Both actions on one endpoint go through the same Portainer connection
+    // and the same Cleanup refresh, so while either one is running the
+    // other is disabled too (its own button keeps its normal text).
+    const endpointBusy = isPending(pruneKey) || isPending(volumesKey);
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Prune images",
-        note: "Removes dangling (untagged, unreferenced) images only. Note that image counts not resetting to 0 is indicative of current API limitations that restrict pruning all unused images. Further pruning would require direct action using the endpoint's Portainer UI.",
+        // (unreleased) This used to say it removed dangling images only and
+        // blamed API limitations for counts not resetting. That limitation
+        // (erwindouna/pyportainer#398) is fixed in pyportainer 1.0.47, which
+        // Home Assistant 2026.10.0 ships, and this integration requires
+        // 2026.10. The call below is dangling=false, so it now removes every
+        // image no container uses, tagged or not.
+        note: "Removes every image that no container (running or stopped) is using, tagged or not. Needs Home Assistant 2026.10 or later; before that only untagged images were removed.",
         badgeText: pruneRowBadge,
         buttonText: "Prune",
         pendingText: "Pruning…",
         pending: isPending(pruneKey),
+        disabled: endpointBusy,
         indent,
         onClick: () => {
           showConfirmDialog(
@@ -1302,7 +1317,6 @@ function renderCleanupRows() {
     );
 
     // 2. Prune unused volumes -- courtesy action, confirm dialog.
-    const volumesKey = `cleanup-volumes:${ep.device_id}`;
     tbody.appendChild(
       renderCleanupActionRow({
         label: "Prune unused volumes",
@@ -1311,6 +1325,7 @@ function renderCleanupRows() {
         buttonText: "Prune",
         pendingText: "Pruning…",
         pending: isPending(volumesKey),
+        disabled: endpointBusy,
         indent,
         onClick: () => {
           showConfirmDialog(
