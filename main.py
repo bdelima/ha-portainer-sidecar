@@ -610,6 +610,33 @@ async def get_config() -> dict[str, str]:
     return {"ha_base_url": HA_PUBLIC_URL or ""}
 
 
+# The bell notification the Portainer Maintenance blueprint keeps up to date
+# ("Portainer is reporting 6 image updates ... Open dashboard to review"). The
+# id is fixed in the integration's bundled blueprint
+# (bundled_blueprints/automation/portainer_automations.yaml, the last step).
+ACTION_ITEMS_NOTIFICATION_ID = "portainer_maintenance_action_items"
+
+
+@app.post("/api/panel-opened")
+async def panel_opened() -> dict[str, bool]:
+    """Called once when the dashboard page loads. Opening the dashboard counts
+    as having read that notification, and a link in a notification cannot run
+    anything itself, so this dismisses it. Best effort: if Home Assistant
+    can't be reached, or the notification isn't there, nothing happens. The
+    blueprint re-creates it the next time it runs and anything is still
+    pending."""
+    try:
+        await ha_call_service(
+            "persistent_notification",
+            "dismiss",
+            {"notification_id": ACTION_ITEMS_NOTIFICATION_ID},
+            timeout=10,
+        )
+    except httpx.HTTPError:
+        pass
+    return {"ok": True}
+
+
 @app.get("/api/action-items")
 async def get_action_items() -> dict[str, Any]:
     result: dict[str, Any] = {}

@@ -16,7 +16,9 @@ const state = {
     stale: { count: 0, items: [] },
     cleanup: { count: 0, items: [] },
   },
-  selection: { updates: new Set(), stale: new Set() },
+  // cleanup holds "<device_id>|<action>" for each ticked row on the Cleanup
+  // tab (action: dangling | unused | volumes).
+  selection: { updates: new Set(), stale: new Set(), cleanup: new Set() },
   haBaseUrl: "",
   // Collapse state, default expanded. Endpoint-level keyed by the
   // endpoint's own device_id (or host name, if that's ever missing);
@@ -443,6 +445,10 @@ function pruneSelection() {
   for (const id of [...state.selection.stale]) {
     if (!staleIds.has(id)) state.selection.stale.delete(id);
   }
+  const cleanupDevices = new Set((state.data.cleanup.items || []).map((ep) => ep.device_id).filter(Boolean));
+  for (const id of [...state.selection.cleanup]) {
+    if (!cleanupDevices.has(cleanupSelDevice(id))) state.selection.cleanup.delete(id);
+  }
 }
 
 function staleDeviceId(item) {
@@ -657,9 +663,9 @@ function renderGroupHeaderRow({
 
   // (fix) This cell used to be appended unconditionally, with only its
   // CONTENTS (the actual <input>) gated on showCheckbox. That's correct
-  // for Updates/Stale, which really do have 3 real columns (checkbox,
-  // name, status) -- but Trouble and Cleanup only declare 2 <th>s each
-  // (no checkbox column exists in their markup at all), so they were
+  // for Updates/Stale/Cleanup, which really do have 3 real columns
+  // (checkbox, name, status) -- but Trouble only declares 2 <th>s
+  // (no checkbox column exists in its markup at all), so it was
   // getting an empty phantom cell here PLUS tdName's own colspan=2 right
   // after it: 3 cells' worth of structure jammed into a 2-column table,
   // which is what visibly shoved every header row's label out of its
@@ -1231,13 +1237,38 @@ function renderStaleRows() {
 }
 
 // ---------------------------------------------------------------------
-// Cleanup tab (1.3.0, new) -- endpoint -> fixed, ordered actions: Prune
-// images -> Prune unused volumes. (1.3.3: was three actions -- Clean
-// dangling images / Reclaim all images / Prune unused volumes -- until the
-// first two turned out to be the same operation in practice; see the
-// (1.3.3) comment in renderCleanupRows for why.) No checkboxes/batch model:
-// each row's button acts immediately on that one endpoint.
+// Cleanup tab -- endpoint -> fixed, ordered actions: Prune dangling images,
+// Prune unused images, Prune unused volumes. Each row has its own button
+// (acts at once on that one endpoint, after a confirmation) and a checkbox:
+// tick any mix of rows, across endpoints, and the action bar's one button runs
+// them all (see runCleanupBatch).
+//
+// History: 1.3.0 had "Clean dangling images" and "Reclaim all images".
+// 1.3.3 hid the first because core's portainer.prune_images (pyportainer's
+// images_prune()) sent its filters in a shape Docker ignored, so both always
+// did the same dangling-only prune (erwindouna/pyportainer#398). That is
+// fixed in pyportainer 1.0.47, which Home Assistant 2026.10 ships, so the two
+// are different operations again and both are back. The unused-image estimate
+// and reclaimable-space badge stay on the "unused" row only: they describe
+// every unused image, not the untagged subset (see 1.3.2).
 // ---------------------------------------------------------------------
+
+// Order matters: it is the order rows are shown and batch steps are run.
+const CLEANUP_ACTIONS = [
+  { id: "dangling", label: "Prune dangling images", short: "dangling images", pendingKey: (d) => `cleanup-prune-dangling:${d}` },
+  { id: "unused", label: "Prune unused images", short: "unused images", pendingKey: (d) => `cleanup-prune-images:${d}` },
+  { id: "volumes", label: "Prune unused volumes", short: "unused volumes", pendingKey: (d) => `cleanup-volumes:${d}` },
+];
+
+function cleanupSelId(deviceId, actionId) {
+  return `${deviceId}|${actionId}`;
+}
+function cleanupSelDevice(selId) {
+  return selId.slice(0, selId.lastIndexOf("|"));
+}
+function cleanupSelAction(selId) {
+  return selId.slice(selId.lastIndexOf("|") + 1);
+}
 
 function mibToCompactGb(mib) {
   if (mib === null || mib === undefined) return null;
@@ -1248,9 +1279,22 @@ function mibToCompactGb(mib) {
 
 // `pending` is this row's own action running (its button reads pendingText);
 // `disabled` additionally greys the button out without changing its text, for
-// when a different action on the same endpoint is running.
-function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, disabled, indent, onClick }) {
+// when a different action on the same endpoint is running. `checkbox` is
+// { checked, onChange } or null (an endpoint with no device_id can't be
+// selected for a batch).
+function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, disabled, indent, checkbox, onClick }) {
   const tr = document.createElement("tr");
+  if (checkbox && checkbox.checked) tr.classList.add("selected");
+
+  const tdCheck = document.createElement("td");
+  if (checkbox) {
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = checkbox.checked;
+    cb.addEventListener("change", () => checkbox.onChange(cb.checked));
+    tdCheck.appendChild(cb);
+  }
+
   const tdName = document.createElement("td");
   const indentClass = indent ? "row-name-indent" : "";
   let html = `<div class="row-name ${indentClass}">${escapeHtml(label)}`;
@@ -1267,7 +1311,7 @@ function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingTex
   btn.addEventListener("click", () => onClick(btn));
   tdAction.appendChild(btn);
 
-  tr.append(tdName, tdAction);
+  tr.append(tdCheck, tdName, tdAction);
   return tr;
 }
 
@@ -1276,32 +1320,39 @@ function renderCleanupRows() {
   tbody.innerHTML = "";
   const items = state.data.cleanup.items || [];
   if (items.length === 0) {
-    tbody.appendChild(emptyRow(2, "No endpoints found."));
+    tbody.appendChild(emptyRow(3, "No endpoints found."));
     return;
   }
 
   const sorted = [...items].sort((a, b) => (a.host || "").localeCompare(b.host || ""));
   const singleEndpoint = sorted.length === 1;
+  const sel = state.selection.cleanup;
 
   for (const ep of sorted) {
     const epKey = ep.device_id || ep.host;
+    const epSelIds = ep.device_id ? CLEANUP_ACTIONS.map((a) => cleanupSelId(ep.device_id, a.id)) : [];
     if (!singleEndpoint) {
       const epExpanded = !state.collapsedEndpoints.has(`cleanup::${epKey}`);
+      const allTicked = epSelIds.length > 0 && epSelIds.every((id) => sel.has(id));
       tbody.appendChild(
         renderGroupHeaderRow({
           label: ep.host,
-          // (fix) This used to be a hardcoded 3 -- the number of action
-          // rows under every endpoint, which is always 3 regardless of
-          // how much there actually is to clean up. That looked exactly
-          // like the "how many things need attention" count every other
-          // tab's header shows, but meant nothing -- every endpoint read
-          // "(3)" no matter what. The real per-endpoint figure is the
-          // same unused-image estimate the "Clean dangling images" row's
-          // own badge already shows; null (unknown/unavailable upstream)
+          // The real per-endpoint figure: the same unused-image estimate
+          // the "unused images" row's badge shows (not the number of
+          // action rows, which is always the same). null (unknown upstream)
           // falls back to 0 rather than leaving the header blank.
           count: ep.unused_estimate ?? 0,
           indent: false,
-          showCheckbox: false,
+          showCheckbox: true,
+          checked: allTicked,
+          indeterminate: !allTicked && epSelIds.some((id) => sel.has(id)),
+          onToggleSelect: (checked) => {
+            for (const id of epSelIds) {
+              if (checked) sel.add(id);
+              else sel.delete(id);
+            }
+            render();
+          },
           expanded: epExpanded,
           onToggleExpand: () => {
             if (epExpanded) state.collapsedEndpoints.add(`cleanup::${epKey}`);
@@ -1314,98 +1365,61 @@ function renderCleanupRows() {
     }
 
     const indent = !singleEndpoint;
-    // (1.3.3) There used to be two separate image actions here -- "Clean
-    // dangling images" (dangling=true) and "Reclaim all images"
-    // (dangling=false, meant to also remove tagged-but-unused images). The
-    // dangling-only button is now hidden: core's `portainer.prune_images`
-    // service calls pyportainer's images_prune(), which builds its request
-    // as bare `?dangling=...`/`?until=...` query params instead of Docker's
-    // actual required shape -- a JSON `filters` query param (confirmed
-    // against Docker Engine's own API spec, moby/moby's api/swagger.yaml,
-    // ImagePrune operation). Docker's daemon never sees a real dangling
-    // filter either way, so it always falls back to its own default prune
-    // scope -- dangling-only -- no matter which value HA sends. That made
-    // the two buttons functionally identical: keeping both, one of them
-    // silently not doing what its label promised, was worse than keeping
-    // one and being honest about its current scope.
-    //
-    // Deliberately still wired as dangling=false (the original "Reclaim"
-    // call), NOT switched to dangling=true -- this is the one line that
-    // will start actually reclaiming every unused image, not just dangling
-    // ones, the moment pyportainer's images_prune() is fixed upstream.
-    // Leaving the real wiring in place means that fix requires zero changes
-    // on our side to take effect; only the button's copy needs to catch up
-    // today.
-    //
-    // (1.3.4) Tracked at https://github.com/erwindouna/pyportainer/issues/398
-    // -- check there before assuming this is still broken. Filed after the
-    // 1.3.3 release above, not before, so it isn't mentioned there.
-    //
-    // (1.3.4) The unused-image estimate and byte-accurate reclaimable-space
-    // badge stay on this row -- carried over unchanged from the old
-    // "Reclaim all images" row, same figures as before the consolidation.
-    // 1.3.3 actually dropped this badge by mistake when the two actions
-    // were merged; restored here. They describe a broader scope than this
-    // action can currently reach (dangling-only, per the note text below),
-    // which is exactly what that note text is for -- the badge is
-    // informational ("here's how much is piling up"), not a promise about
-    // what THIS press of the button will remove.
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const pruneRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+    const unusedRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
-    const pruneKey = `cleanup-prune-images:${ep.device_id}`;
-    const volumesKey = `cleanup-volumes:${ep.device_id}`;
-    // Both actions on one endpoint go through the same Portainer connection
-    // and the same Cleanup refresh, so while either one is running the
-    // other is disabled too (its own button keeps its normal text).
-    const endpointBusy = isPending(pruneKey) || isPending(volumesKey);
-    tbody.appendChild(
-      renderCleanupActionRow({
-        label: "Prune images",
-        // (unreleased) This used to say it removed dangling images only and
-        // blamed API limitations for counts not resetting. That limitation
-        // (erwindouna/pyportainer#398) is fixed in pyportainer 1.0.47, which
-        // Home Assistant 2026.10.0 ships, and this integration requires
-        // 2026.10. The call below is dangling=false, so it now removes every
-        // image no container uses, tagged or not.
+    // All three actions on one endpoint go through the same Portainer
+    // connection and the same Cleanup refresh, so while any one is running the
+    // others are disabled too (their own buttons keep their normal text).
+    const endpointBusy = CLEANUP_ACTIONS.some((a) => isPending(a.pendingKey(ep.device_id)));
+
+    // Both image actions send dangling=<true|false> to
+    // portainer_maintenance.prune_images, which core's portainer.prune_images
+    // turns into Docker's `dangling` filter. Needs Home Assistant 2026.10 /
+    // pyportainer 1.0.47 or later; before that Docker never saw the filter.
+    const specs = {
+      dangling: {
+        note: "Removes only untagged images that no container uses, which includes the old image an update leaves behind. “Prune unused images” also removes tagged ones. Needs Home Assistant 2026.10 or later.",
+        badgeText: null,
+        confirm: `Remove every dangling (untagged, unused) image on ${ep.host}? This cannot be undone.`,
+        run: () => pruneImages(true, null, [ep.device_id]),
+      },
+      unused: {
         note: "Removes every image that no container (running or stopped) is using, tagged or not. Needs Home Assistant 2026.10 or later; before that only untagged images were removed.",
-        badgeText: pruneRowBadge,
-        buttonText: "Prune",
-        pendingText: "Pruning…",
-        pending: isPending(pruneKey),
-        disabled: endpointBusy,
-        indent,
-        onClick: () => {
-          showConfirmDialog(
-            `Remove every unused image on ${ep.host}? This cannot be undone — a container started again afterward will need to re-pull its image.`,
-            "Prune",
-            () => runPending(pruneKey, () => pruneImages(false, null, [ep.device_id]))
-          );
-        },
-      })
-    );
-
-    // 2. Prune unused volumes -- courtesy action, confirm dialog.
-    tbody.appendChild(
-      renderCleanupActionRow({
-        label: "Prune unused volumes",
+        badgeText: unusedRowBadge,
+        confirm: `Remove every unused image on ${ep.host}? This cannot be undone — a container started again afterward will need to re-pull its image.`,
+        run: () => pruneImages(false, null, [ep.device_id]),
+      },
+      volumes: {
         note: "Same action as Portainer's own “Prune unused volumes” button — core's Portainer integration gives limited visibility into what's actually unused.",
         badgeText: null,
-        buttonText: "Prune",
-        pendingText: "Pruning…",
-        pending: isPending(volumesKey),
-        disabled: endpointBusy,
-        indent,
-        onClick: () => {
-          showConfirmDialog(
-            `Remove every unused Docker volume on ${ep.host}? This cannot be undone.`,
-            "Prune",
-            () => runPending(volumesKey, () => pruneVolumes([ep.device_id]))
-          );
-        },
-      })
-    );
+        confirm: `Remove every unused Docker volume on ${ep.host}? This cannot be undone.`,
+        run: () => pruneVolumes([ep.device_id]),
+      },
+    };
+
+    for (const action of CLEANUP_ACTIONS) {
+      const spec = specs[action.id];
+      const pendingKey = action.pendingKey(ep.device_id);
+      const selId = ep.device_id ? cleanupSelId(ep.device_id, action.id) : null;
+      tbody.appendChild(
+        renderCleanupActionRow({
+          label: action.label,
+          note: spec.note,
+          badgeText: spec.badgeText,
+          buttonText: "Prune",
+          pendingText: "Pruning…",
+          pending: isPending(pendingKey),
+          disabled: endpointBusy,
+          indent,
+          checkbox: selId ? { checked: sel.has(selId), onChange: (checked) => toggleSelection("cleanup", selId, checked) } : null,
+          onClick: () => {
+            showConfirmDialog(spec.confirm, "Prune", () => runPending(pendingKey, spec.run));
+          },
+        })
+      );
+    }
   }
 }
 
@@ -1418,7 +1432,7 @@ function toggleSelection(category, id, checked) {
 function renderActionBar() {
   const bar = el("action-bar");
   const category = state.activeTab;
-  if (category === "trouble" || category === "cleanup") {
+  if (category === "trouble") {
     bar.hidden = true;
     return;
   }
@@ -1429,20 +1443,26 @@ function renderActionBar() {
   }
   bar.hidden = false;
   el("selection-count").textContent = `${sel.size} selected`;
-  const batchKey = category === "stale" ? "delete-stale-batch" : "install-batch";
+  const batchKey =
+    category === "stale" ? "delete-stale-batch" : category === "cleanup" ? "cleanup-batch" : "install-batch";
   const pending = isPending(batchKey);
   const btn = el("action-btn");
-  btn.className = category === "stale" ? "primary-btn danger" : "primary-btn";
+  btn.className = category === "stale" || category === "cleanup" ? "primary-btn danger" : "primary-btn";
   btn.disabled = pending;
   btn.textContent = pending
     ? category === "stale"
       ? `Deleting ${sel.size} device(s)…`
-      : `Installing ${sel.size} update(s)…`
+      : category === "cleanup"
+        ? `Pruning ${sel.size} item(s)…`
+        : `Installing ${sel.size} update(s)…`
     : category === "stale"
       ? `Delete ${sel.size} device(s)`
-      : `Install ${sel.size} update(s)`;
+      : category === "cleanup"
+        ? `Prune ${sel.size} selected`
+        : `Install ${sel.size} update(s)`;
   btn.onclick = () => {
     if (category === "stale") confirmDeleteSelected();
+    else if (category === "cleanup") confirmCleanupBatch();
     else {
       const ids = [...sel];
       runPending([batchKey, ...ids.map((id) => `install:${id}`)], () => installUpdates(ids));
@@ -1454,6 +1474,10 @@ function selectAll(category, checked) {
   const items = state.data[category].items || [];
   if (checked) {
     for (const item of items) {
+      if (category === "cleanup") {
+        if (item.device_id) for (const a of CLEANUP_ACTIONS) state.selection.cleanup.add(cleanupSelId(item.device_id, a.id));
+        continue;
+      }
       const id = category === "stale" ? staleDeviceId(item) : item.entity;
       if (id) state.selection[category].add(id);
     }
@@ -1896,6 +1920,103 @@ async function pruneVolumes(deviceIds) {
   loadActionItems();
 }
 
+// ---- Cleanup batch (ticked rows -> one run) ----
+//
+// Turns the ticked rows into an ordered list of steps: endpoints in the same
+// order as the table, and within one endpoint dangling -> unused -> volumes.
+// Where "unused images" is ticked, "dangling images" is not run on its own: it
+// is a subset, so a second pass would only repeat the same work.
+function cleanupBatchPlan(ids) {
+  const hosts = new Map((state.data.cleanup.items || []).map((ep) => [ep.device_id, ep.host]));
+  const perDevice = new Map();
+  for (const id of ids) {
+    const device = cleanupSelDevice(id);
+    if (!hosts.has(device)) continue;
+    if (!perDevice.has(device)) perDevice.set(device, new Set());
+    perDevice.get(device).add(cleanupSelAction(id));
+  }
+  const steps = [];
+  let covered = 0;
+  const ordered = [...perDevice.entries()].sort((a, b) => (hosts.get(a[0]) || "").localeCompare(hosts.get(b[0]) || ""));
+  for (const [device, actions] of ordered) {
+    for (const action of CLEANUP_ACTIONS) {
+      if (!actions.has(action.id)) continue;
+      if (action.id === "dangling" && actions.has("unused")) {
+        covered++;
+        continue;
+      }
+      steps.push({ deviceId: device, host: hosts.get(device), action: action.id });
+    }
+  }
+  return { steps, covered };
+}
+
+function describeCleanupSteps(steps) {
+  const parts = [];
+  for (const action of CLEANUP_ACTIONS) {
+    const hostNames = steps.filter((s) => s.action === action.id).map((s) => s.host);
+    if (hostNames.length) parts.push(`${action.short} on ${hostNames.join(", ")}`);
+  }
+  return parts.join("; ");
+}
+
+function confirmCleanupBatch() {
+  const { steps, covered } = cleanupBatchPlan([...state.selection.cleanup]);
+  if (steps.length === 0) return;
+  let text = `Prune ${describeCleanupSteps(steps)}? This cannot be undone.`;
+  if (covered > 0) {
+    text += " Dangling images are not run separately where all unused images are pruned, since that already includes them.";
+  }
+  showConfirmDialog(text, "Prune", () => runPending("cleanup-batch", () => runCleanupBatch()));
+}
+
+async function postCleanupStep(step) {
+  const volumes = step.action === "volumes";
+  const body = volumes
+    ? { device_ids: [step.deviceId] }
+    : { dangling: step.action === "dangling", until_hours: null, device_ids: [step.deviceId] };
+  try {
+    const res = await fetch(volumes ? "/api/actions/prune-volumes" : "/api/actions/prune-images", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return true;
+  } catch (e) {
+    console.error(e);
+    return false;
+  }
+}
+
+// One step at a time, never in parallel: two actions on the same endpoint
+// share one Portainer connection and one Cleanup refresh (see the busy rule in
+// renderCleanupRows), and each request is the same single-endpoint call the
+// per-row buttons make, so it keeps their timeout. Every row in the batch shows
+// busy from the start, then frees up as its own step finishes. Ticks for steps
+// that succeeded are cleared; a failed step stays ticked so it can be retried.
+async function runCleanupBatch() {
+  const { steps } = cleanupBatchPlan([...state.selection.cleanup]);
+  const keyOf = (s) => CLEANUP_ACTIONS.find((a) => a.id === s.action).pendingKey(s.deviceId);
+  for (const s of steps) state.pendingActions.add(keyOf(s));
+  render();
+  showToast(`Pruning ${steps.length} item${steps.length === 1 ? "" : "s"}…`);
+  let failed = 0;
+  for (const s of steps) {
+    const ok = await postCleanupStep(s);
+    state.pendingActions.delete(keyOf(s));
+    if (ok) {
+      state.selection.cleanup.delete(cleanupSelId(s.deviceId, s.action));
+      if (s.action === "unused") state.selection.cleanup.delete(cleanupSelId(s.deviceId, "dangling"));
+    } else {
+      failed++;
+    }
+    render();
+  }
+  showToast(failed === 0 ? `Prune requested: ${steps.length} item${steps.length === 1 ? "" : "s"}` : `${failed} of ${steps.length} failed — see console`);
+  loadActionItems();
+}
+
 let toastTimer = null;
 
 function showToast(text) {
@@ -1975,5 +2096,9 @@ const initialTab = tabFromHash();
 if (initialTab) activateTab(initialTab);
 
 loadConfig();
+// Opening the dashboard counts as having read Home Assistant's "Portainer is
+// reporting ..." bell notification, so ask the backend to dismiss it. Best
+// effort: nothing here depends on the answer.
+fetch("/api/panel-opened", { method: "POST" }).catch(() => {});
 loadActionItems();
 setInterval(loadActionItems, REFRESH_MS);

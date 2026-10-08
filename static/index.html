@@ -67,16 +67,16 @@
       </table>
     </section>
 
-    <!-- (1.3.0) Replaced the old always-visible "Image cleanup" toolbar
-         (checkbox-free, un-grouped, always shown above every tab) with a
-         proper 4th tab, tree-grouped by endpoint like the others. No
-         checkbox column at all -- three ordered, per-endpoint action rows
-         (Clean dangling -> Reclaim all images -> Prune unused volumes)
-         with immediate per-row buttons, not a multi-select batch model. -->
+    <!-- Cleanup: tree-grouped by endpoint like the others, with three ordered
+         action rows per endpoint (Prune dangling images -> Prune unused
+         images -> Prune unused volumes). Each row has its own button for an
+         immediate single action, and a checkbox so several can be run at once
+         from the action bar. -->
     <section class="panel" data-panel="cleanup" hidden>
       <table class="item-table">
         <thead>
           <tr>
+            <th class="col-check"><input type="checkbox" data-select-all="cleanup"></th>
             <th>Endpoint / action</th>
             <th>Info</th>
           </tr>
