@@ -458,10 +458,10 @@ h1 {
 }
 
 /* (1.3.0) Cleanup tab -- endpoint header row plus one row per ordered
-   action (Clean dangling / Reclaim all images / Prune unused volumes).
+   action (Prune dangling images / Prune unused images / Prune unused volumes).
    Info badges (unused-image estimate, reclaimable space) sit inline next
    to the action's own label rather than in a separate column, since the
-   table's second column is reserved for the row's action button.
+   table's last column is reserved for the row's action button.
    (1.3.3) Originally --chip-bg/--text, which is close enough to the
    surrounding row background and text color that the badge barely read
    as a separate element -- easy to miss the exact thing it exists to
