@@ -48,7 +48,7 @@ This app doesn't create those sensors or those services itself — see the [Port
 
 ## Requirements
 
-This app itself has no Home Assistant version dependency of its own — it only talks to whatever sensors and services the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration exposes over HA's REST API. That integration currently requires **Home Assistant 2026.8 or later**, and has only been run and tested against **Home Assistant Container Edition**; see its README for details. If this app's tabs look empty or the sensors above 404, check that the integration itself is installed and set up correctly before troubleshooting this app.
+This app itself has no Home Assistant version dependency of its own — it only talks to whatever sensors and services the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration exposes over HA's REST API. That integration currently requires **Home Assistant 2026.10 or later**, and has only been run and tested against **Home Assistant Container Edition**; see its README for details. If this app's tabs look empty or the sensors above 404, check that the integration itself is installed and set up correctly before troubleshooting this app.
 
 ## Configuration
 
