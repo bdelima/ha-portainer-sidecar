@@ -49,6 +49,14 @@ const state = {
   // stack_restart_needed item at all (resolved some other way -- manual
   // Portainer intervention, an endpoint reload, etc).
   stackRestartErrors: new Map(),
+  // Outcome of the last install attempt per update entity, keyed by
+  // entity id: { kind: "installed" | "failed" | "timed_out" | "unknown",
+  // message, detail, needsStackRestart, at }. A row renders from this
+  // (not just from pendingActions) so that when a job resolves the row
+  // moves straight from "Installing..." to a visible result instead of
+  // falling back to "Install" until the next fetch. See
+  // pruneInstallResults() for when an entry is dropped.
+  installResults: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -416,6 +424,7 @@ async function loadActionItems() {
     state.data = await res.json();
     pruneSelection();
     pruneStackRestartErrors();
+    pruneInstallResults();
     render();
     el("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch (e) {
@@ -438,6 +447,32 @@ function pruneSelection() {
 
 function staleDeviceId(item) {
   return item?.device_id || null;
+}
+
+// How long an "Installed" row is held while the server data still lists
+// the update. Normally the very next fetch no longer lists it (the
+// integration hides an update as soon as perform_update succeeds); this cap
+// only matters if the server keeps listing it, so the row falls back to
+// what the server says rather than claiming "Installed" forever.
+const INSTALLED_HOLD_MS = 120000;
+
+// Drop an install result once the server data has caught up with it:
+//   - the update is no longer listed -> the outcome is confirmed (an
+//     installed row simply disappears; a failed row has nothing left to
+//     retry because the server no longer offers the update), or
+//   - an "Installed" row has been waiting longer than INSTALLED_HOLD_MS.
+// A failed / timed_out / unknown result otherwise stays until the user
+// retries it.
+function pruneInstallResults() {
+  if (state.installResults.size === 0) return;
+  const listed = new Set((state.data.updates.items || []).map((i) => i.entity));
+  const now = Date.now();
+  for (const [entityId, result] of [...state.installResults]) {
+    if (!listed.has(entityId)) state.installResults.delete(entityId);
+    else if (result.kind === "installed" && now - result.at > INSTALLED_HOLD_MS) {
+      state.installResults.delete(entityId);
+    }
+  }
 }
 
 // Drop a persistent restart error once its stack no longer has an open
@@ -687,6 +722,30 @@ function renderGroupHeaderRow({
 // rather than a fake "Standalone" grouping node.
 // ---------------------------------------------------------------------
 
+// The status text next to a row's Install button: "Update available" when
+// there's no install result, otherwise the outcome of the last attempt.
+function installResultStatus(result) {
+  const span = document.createElement("span");
+  span.className = "row-secondary";
+  if (!result) {
+    span.textContent = "Update available";
+    return span;
+  }
+  if (result.kind === "installed") {
+    span.textContent = result.needsStackRestart
+      ? "Installed — stack needs a restart, see the Needs Remediation tab"
+      : "Installed — confirming…";
+    return span;
+  }
+  span.textContent = result.message;
+  span.title = result.detail || result.message;
+  span.style.fontWeight = "500";
+  // A confirmed failure is red; a timeout or lost job is "outcome unknown",
+  // which is a warning, not a verdict.
+  span.style.color = result.kind === "failed" ? "var(--danger)" : "var(--warn)";
+  return span;
+}
+
 function renderUpdateChildRow(item, indentLevel) {
   const tr = document.createElement("tr");
   tr.className = "stack-child-row";
@@ -706,14 +765,25 @@ function renderUpdateChildRow(item, indentLevel) {
   const tdStatus = document.createElement("td");
   const installKey = `install:${item.entity}`;
   const installPending = isPending(installKey);
+  const installResult = installPending ? null : state.installResults.get(item.entity) || null;
   const installBtn = document.createElement("button");
   installBtn.className = "row-action-btn";
-  installBtn.textContent = installPending ? "Installing…" : "Install";
-  installBtn.disabled = installPending;
+  if (installPending) {
+    installBtn.textContent = "Installing…";
+    installBtn.disabled = true;
+  } else if (installResult && installResult.kind === "installed") {
+    installBtn.textContent = "Installed";
+    installBtn.disabled = true;
+  } else if (installResult) {
+    installBtn.textContent = "Retry";
+  } else {
+    installBtn.textContent = "Install";
+  }
   installBtn.addEventListener("click", () => {
+    state.installResults.delete(item.entity);
     runPending(installKey, () => installUpdates([item.entity]));
   });
-  tdStatus.innerHTML = `<span class="row-secondary">Update available</span>`;
+  tdStatus.appendChild(installResultStatus(installResult));
   tdStatus.appendChild(installBtn);
   if (item.changelog_repo) {
     // (1.3.8) Renders release notes in-app (see showChangelogDialog) --
@@ -1385,9 +1455,96 @@ function endpointKeyForUpdateEntity(entityId) {
   return (item && (item.host_device_id || item.host)) || "__unknown__";
 }
 
-async function installUpdates(entityIds) {
-  if (entityIds.length === 0) return;
-  showToast(`Installing ${entityIds.length} update(s)…`);
+// Portainer's own container is what performs every other recreate on its
+// host, so updating it replaces the actuator mid-batch: the next job would
+// start while Portainer is restarting. The backend runs each endpoint's
+// jobs strictly in the order they're submitted, so putting Portainer's own
+// update last within a batch means nothing else on that host is still
+// waiting on it. Matched by container name ("portainer") -- the update item
+// only carries the device name, not the image.
+function isPortainerOwnUpdate(entityId) {
+  const item = (state.data.updates.items || []).find((i) => i.entity === entityId);
+  if (!item || !item.name) return false;
+  return item.name.replace(/\s*\([^)]*\)\s*$/, "").trim().toLowerCase() === "portainer";
+}
+
+function orderPortainerLast(entityIds) {
+  return [
+    ...entityIds.filter((id) => !isPortainerOwnUpdate(id)),
+    ...entityIds.filter((id) => isPortainerOwnUpdate(id)),
+  ];
+}
+
+// Home Assistant's own update goes after everything else in a batch, and
+// only once every other job -- on every endpoint -- has finished. Recreating
+// the homeassistant container restarts the thing that is running the
+// install (perform_update is a service call into HA), so anything still
+// queued or running behind it would be cut off. The backend's per-endpoint
+// queues run concurrently across endpoints, so submit order alone can't
+// guarantee this; the batch is split into two submissions instead.
+// Matched by container name (homeassistant / home-assistant / home_assistant)
+// or by the update's changelog repo, because the update item carries no
+// image field.
+function isHomeAssistantOwnUpdate(entityId) {
+  const item = (state.data.updates.items || []).find((i) => i.entity === entityId);
+  if (!item) return false;
+  if (String(item.changelog_repo || "").toLowerCase() === "home-assistant/core") return true;
+  if (!item.name) return false;
+  const name = item.name.replace(/\s*\([^)]*\)\s*$/, "").trim().toLowerCase();
+  return name === "homeassistant" || name === "home-assistant" || name === "home_assistant";
+}
+
+// Splits a batch into submission groups, in the order they must run:
+// everything else first (Portainer's own update last within it), then Home
+// Assistant. Empty groups are dropped.
+function installGroups(entityIds) {
+  const ha = entityIds.filter((id) => isHomeAssistantOwnUpdate(id));
+  const rest = orderPortainerLast(entityIds.filter((id) => !isHomeAssistantOwnUpdate(id)));
+  return [rest, ha].filter((g) => g.length > 0);
+}
+
+// Short, single-line version of a backend job error for the row's status
+// text. The full text stays available as the row's tooltip.
+function shortInstallError(err) {
+  const text = String(err || "")
+    .replace(/\s+For more information check:.*$/s, "")
+    .replace(/\s+for url\s+'[^']*'/i, "")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "see the sidecar logs";
+  return text.length > 100 ? text.slice(0, 100) + "…" : text;
+}
+
+function installResultFromJob(job) {
+  const at = Date.now();
+  if (job.status === "succeeded") {
+    return { kind: "installed", needsStackRestart: !!job.needs_stack_restart, at };
+  }
+  if (job.status === "timed_out") {
+    return {
+      kind: "timed_out",
+      message: "Timed out — outcome unknown, check before retrying",
+      detail: job.error || "",
+      at,
+    };
+  }
+  if (job.status === "unknown") {
+    return {
+      kind: "unknown",
+      message: "Status lost (job expired or the app restarted) — check before retrying",
+      detail: job.error || "",
+      at,
+    };
+  }
+  return { kind: "failed", message: `Failed — ${shortInstallError(job.error)}`, detail: job.error || "", at };
+}
+
+// Submits one group of updates and polls it to completion. Returns the
+// outcome lists so installUpdates can report one summary for the whole
+// batch (which may be several groups run back to back).
+async function runInstallGroup(entityIds) {
+  const outcome = { errors: [], timedOut: [], needsStackRestart: [], submitFailed: false };
 
   let jobIds;
   try {
@@ -1403,15 +1560,18 @@ async function installUpdates(entityIds) {
   } catch (e) {
     showToast("Install failed to submit — see console");
     console.error(e);
+    // Nothing was submitted, so these rows are not installing: clear their
+    // busy state rather than leaving them stuck on "Installing…".
+    for (const id of entityIds) state.pendingActions.delete(`install:${id}`);
+    render();
     loadActionItems();
-    return;
+    outcome.submitFailed = true;
+    return outcome;
   }
 
   // job_ids comes back in the same order entityIds was submitted in.
   const jobs = jobIds.map((jobId, i) => ({ jobId, entityId: entityIds[i], done: false }));
-  const errors = [];
-  const timedOut = [];
-  const needsStackRestart = [];
+  const { errors, timedOut, needsStackRestart } = outcome;
   const deadline = Date.now() + INSTALL_POLL_MAX_MS;
 
   while (jobs.some((j) => !j.done) && Date.now() < deadline) {
@@ -1435,7 +1595,6 @@ async function installUpdates(entityIds) {
       if (!job || job.done || s.status === "queued" || s.status === "running") continue;
       job.done = true;
       state.selection.updates.delete(job.entityId);
-      state.pendingActions.delete(`install:${job.entityId}`);
       if (s.status === "succeeded") {
         if (s.needs_stack_restart) needsStackRestart.push(job.entityId);
       } else if (s.status === "timed_out") {
@@ -1443,7 +1602,16 @@ async function installUpdates(entityIds) {
       } else {
         errors.push(job.entityId);
       }
+      // Record the outcome BEFORE clearing the busy state, so the row goes
+      // straight from "Installing…" to its result. Clearing the busy state
+      // first and redrawing from the last fetched data is what used to
+      // flip the row back to "Install" until the next poll. The fetch
+      // right after is what lets an installed row drop out as soon as the
+      // server stops listing it.
+      state.installResults.set(job.entityId, installResultFromJob(s));
+      state.pendingActions.delete(`install:${job.entityId}`);
       render();
+      loadActionItems();
     }
   }
 
@@ -1455,10 +1623,51 @@ async function installUpdates(entityIds) {
     if (job.done) continue;
     job.done = true;
     state.selection.updates.delete(job.entityId);
+    state.installResults.set(job.entityId, {
+      kind: "timed_out",
+      message: "Still running after 20 minutes — outcome unknown, check before retrying",
+      detail: "",
+      at: Date.now(),
+    });
     state.pendingActions.delete(`install:${job.entityId}`);
     timedOut.push(job.entityId);
   }
 
+  return outcome;
+}
+
+async function installUpdates(entityIds) {
+  if (entityIds.length === 0) return;
+  const groups = installGroups(entityIds);
+  const ordered = groups.flat();
+  for (const id of ordered) state.installResults.delete(id);
+  showToast(`Installing ${ordered.length} update(s)…`);
+
+  const errors = [];
+  const timedOut = [];
+  const needsStackRestart = [];
+  let submitFailed = false;
+  for (const [n, group] of groups.entries()) {
+    if (n > 0) {
+      showToast(
+        group.length === 1 && isHomeAssistantOwnUpdate(group[0])
+          ? "Everything else is done — installing Home Assistant last…"
+          : `Installing ${group.length} more update(s)…`,
+      );
+    }
+    const outcome = await runInstallGroup(group);
+    errors.push(...outcome.errors);
+    timedOut.push(...outcome.timedOut);
+    needsStackRestart.push(...outcome.needsStackRestart);
+    if (outcome.submitFailed) submitFailed = true;
+  }
+
+  // A group that failed to submit has already toasted that; don't overwrite
+  // it with a misleading "Installed N" summary.
+  if (submitFailed && errors.length === 0 && timedOut.length === 0) {
+    loadActionItems();
+    return;
+  }
   if (errors.length > 0 || timedOut.length > 0) {
     const parts = [];
     if (errors.length > 0) parts.push(`${errors.length} error(s)`);
@@ -1469,9 +1678,9 @@ async function installUpdates(entityIds) {
     // Trouble tab, which is where the actual remediation now lives (see
     // renderTroubleRows above). Trouble picks this up on its own next
     // poll without anything special needed here.
-    showToast(`Installed ${entityIds.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
+    showToast(`Installed ${ordered.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
   } else {
-    showToast(`Installed ${entityIds.length} update(s)`);
+    showToast(`Installed ${ordered.length} update(s)`);
   }
   loadActionItems();
 }
