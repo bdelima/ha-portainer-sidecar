@@ -253,7 +253,9 @@ async def ha_call_service(domain: str, service: str, data: dict[str, Any], timeo
         resp.raise_for_status()
 
 
-async def ha_call_service_with_response(domain: str, service: str, data: dict[str, Any]) -> dict[str, Any]:
+async def ha_call_service_with_response(
+    domain: str, service: str, data: dict[str, Any], timeout: float = 180
+) -> dict[str, Any]:
     """Same as ha_call_service, but for a service registered with
     supports_response (perform_update below) -- the ?return_response query
     param is what makes HA's REST API include service_response in the body
@@ -273,8 +275,12 @@ async def ha_call_service_with_response(domain: str, service: str, data: dict[st
     generic-wrapped exception text -- see the integration's
     _await_recreate_outcome for why). A shorter client timeout here would
     surface a false timeout error to the user while the backend was still
-    correctly working it out."""
-    async with httpx.AsyncClient(timeout=180) as client:
+    correctly working it out.
+
+    `timeout` overrides that 180s default for a caller whose backend
+    legitimately takes longer (update_portainer below waits on an image
+    pull of up to 5 minutes)."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             f"{HA_BASE_URL}/api/services/{domain}/{service}?return_response",
             headers=HEADERS,
@@ -653,6 +659,64 @@ async def dismiss_trouble_item(payload: DismissRequest) -> dict[str, Any]:
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"dismiss failed: {exc}") from exc
     return {"ok": True}
+
+
+class UpdatePortainerRequest(BaseModel):
+    update_entity: str
+
+    @field_validator("update_entity")
+    @classmethod
+    def _check_entity(cls, value: str) -> str:
+        # Sanity check only -- the integration re-validates that this is a
+        # Portainer server/agent update entity and refuses anything else.
+        value = value.strip()
+        domain, _, object_id = value.partition(".")
+        if domain != "update" or not object_id or len(value) > 255:
+            raise ValueError("update_entity must look like 'update.<object_id>'")
+        return value
+
+
+def _ha_error_message(exc: httpx.HTTPError) -> str:
+    """HA's REST API puts the reason a service call failed in the response
+    body: a ServiceValidationError is a 400 with the text as JSON or plain
+    text, any other HomeAssistantError a 500 with {"message": ...}. Pull
+    that text out so the user sees "the update entity is not pending"
+    instead of "Server error '500 Internal Server Error' for url ..."."""
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            body = response.json()
+            if isinstance(body, dict) and body.get("message"):
+                return str(body["message"])
+        except ValueError:
+            pass
+        text = (response.text or "").strip()
+        if text:
+            return text[:500]
+    return str(exc)
+
+
+@app.post("/api/actions/update-portainer")
+async def update_portainer(payload: UpdatePortainerRequest) -> dict[str, Any]:
+    """Updates Portainer's own server or agent container, which the normal
+    install path refuses (a container can't recreate itself). Delegates to
+    portainer_maintenance.update_portainer (HA side), which starts a
+    short-lived portainer-updater helper container and returns as soon as
+    it has started -- the update itself then happens out of band and
+    Portainer restarts partway through. Needs an integration version that
+    has that service; an older one answers 502 here."""
+    try:
+        result = await ha_call_service_with_response(
+            "portainer_maintenance",
+            "update_portainer",
+            {"update_entity": payload.update_entity},
+            timeout=330,
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"Portainer update failed: {_ha_error_message(exc)}"
+        ) from exc
+    return {"ok": True, **result}
 
 
 # ---------------------------------------------------------------------

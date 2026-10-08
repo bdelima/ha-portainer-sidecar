@@ -990,6 +990,27 @@ function renderTroubleChildRow(item, indentLevel) {
     info.addEventListener("click", () => showInfoDialog(item.name, item.detail));
     tdStatus.appendChild(info);
   }
+  // Update now: only for a Portainer server/agent update the integration
+  // says it can start itself (`update_now`; an older integration doesn't
+  // send it, so those rows keep just More Info and the manual steps). It is
+  // confirmed first because Portainer goes away while it updates, and the
+  // Updates tab already runs everything else before it for the same reason.
+  if (item.update_now && item.entity) {
+    const pendingKey = `portainer-update:${item.entity}`;
+    const pending = isPending(pendingKey);
+    const upd = document.createElement("button");
+    upd.className = "row-action-btn";
+    upd.textContent = pending ? "Updating…" : "Update now";
+    upd.disabled = pending;
+    upd.addEventListener("click", () =>
+      showConfirmDialog(
+        `Update ${item.name} now? Portainer will restart and be unavailable for a minute or two, and this page cannot show progress. Do any other updates first.`,
+        "Update now",
+        () => runPending(pendingKey, () => updatePortainer(item.entity)),
+      ),
+    );
+    tdStatus.appendChild(upd);
+  }
   if (item.dismiss_key) {
     const pendingKey = `dismiss:${item.dismiss_key}`;
     const pending = isPending(pendingKey);
@@ -1758,6 +1779,32 @@ async function dismissTroubleItem(dismissKey) {
     showToast("Dismissed");
   } catch (e) {
     showToast(`Dismiss failed — ${e.message}`);
+    console.error(e);
+  }
+  await loadActionItems();
+}
+
+async function updatePortainer(entityId) {
+  try {
+    const res = await fetch("/api/actions/update-portainer", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ update_entity: entityId }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch {
+        // Response wasn't JSON -- fall through with just the status.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    // The row stays until the integration stops listing it; this only means
+    // the helper container started, not that Portainer has finished.
+    showToast("Updater started — Portainer will restart");
+  } catch (e) {
+    showToast(`Portainer update failed — ${e.message}`);
     console.error(e);
   }
   await loadActionItems();
