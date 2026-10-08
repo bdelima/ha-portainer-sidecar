@@ -40,6 +40,7 @@ It's a two-piece app: a small FastAPI backend that holds a Home Assistant long-l
   - *(1.3.12)* `#needs-remediation` now works the same way (aliased onto the same tab — see the 1.3.12 note above), since that's the hash the integration's trouble notification links to as of its own 1.3.5 release.
 - **Colored tab badges** *(1.3.2)*: each tab's count badge now turns a distinct color the moment it's non-zero — blue for Updates, red for Trouble, orange for Stale and Cleanup — as a quick "something here needs a look" cue, and returns to the neutral dark pill once that tab is back to zero. The active tab's own highlighting (its text color and underline) is unchanged; its badge just no longer gets forced blue regardless of which tab that actually is.
 - Polls for updates every 15 seconds.
+- **Sign-in** *(unreleased)*: the app now has a login of its own. Set `AUTH_USERNAME` and `AUTH_PASSWORD` and every page and `/api/*` call needs a session; the Portainer Maintenance integration's setup form takes the same pair so its Home Assistant sidebar panel signs in by itself. `AUTH_ALLOW_ANONYMOUS=true` turns it off for testing. **Breaking on upgrade:** with none of these set, the app now serves nothing but `/healthz` and `/version` until you configure one. See [Authentication](#authentication).
 
 This app doesn't create those sensors or those services itself — see the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration, which this app is designed to pair with.
 
@@ -54,6 +55,9 @@ This app itself has no Home Assistant version dependency of its own — it only 
 | `HA_TOKEN` (or `HA_TOKEN_FILE`) | Yes | A Home Assistant long-lived access token (Profile → Security → Long-Lived Access Tokens). Treat it as a secret with full API access as whichever HA user created it. `HA_TOKEN_FILE` (pointing at a mounted secret file) is preferred over the plain env var, since it keeps the token out of `docker inspect`/compose-file output. |
 | `HA_BASE_URL` | No | Your Home Assistant instance's base URL, e.g. `http://homeassistant:8123`. If omitted, the app auto-discovers it on startup (see below) — set this explicitly only if discovery doesn't find your setup, or if you want to pin it. |
 | `HA_PUBLIC_URL` | No | The browser-facing URL for "open in Home Assistant" links (e.g. `https://homeassistant.example.com`). Only meaningful if you've also set `HA_BASE_URL` explicitly to something a browser can't reach (a container hostname or internal IP) — reused automatically for links whenever `HA_BASE_URL` was set by hand. Not needed if you let auto-discovery find `HA_BASE_URL`, since discovery only accepts addresses that are already browser-reachable on your LAN. |
+| `AUTH_USERNAME` | Yes, with `AUTH_PASSWORD` (or `AUTH_ALLOW_ANONYMOUS`) | Username for the web UI's sign-in. See [Authentication](#authentication). |
+| `AUTH_PASSWORD` | Yes, with `AUTH_USERNAME` (or `AUTH_ALLOW_ANONYMOUS`) | Password for the web UI's sign-in. Keeping it in the compose file is fine for a LAN tool: that file is already access-controlled (in Portainer, for example). |
+| `AUTH_ALLOW_ANONYMOUS` | No | `true` turns authentication off entirely (testing). Wins over `AUTH_USERNAME`/`AUTH_PASSWORD` if both are set. Default off. |
 
 ### Auto-discovery
 
@@ -87,11 +91,14 @@ services:
     restart: unless-stopped
     environment:
       HA_TOKEN_FILE: /run/secrets/ha_token
+      AUTH_USERNAME: "admin"
+      AUTH_PASSWORD: "choose-a-password"  # also enter these in the integration's setup form
+      # AUTH_ALLOW_ANONYMOUS: "true"      # testing only: turns the sign-in off
       # HA_BASE_URL: "http://homeassistant:8123"  # only needed if auto-discovery doesn't find your HA instance
     volumes:
       - ./ha_token:/run/secrets/ha_token:ro
     # No ports: mapping by default -- put a reverse proxy in front (see
-    # "Security" below) rather than exposing port 8000 directly.
+    # "Authentication" below) rather than exposing port 8000 directly.
 ```
 
 Create a plain-text `ha_token` file next to the compose file containing your long-lived access token, then `docker compose up -d`. (Swap `image:` for `build: .` if you'd rather build from source.)
@@ -101,6 +108,8 @@ Create a plain-text `ha_token` file next to the compose file containing your lon
 ```bash
 docker run -d \
   -e HA_TOKEN="your-long-lived-access-token" \
+  -e AUTH_USERNAME="admin" \
+  -e AUTH_PASSWORD="choose-a-password" \
   -p 8000:8000 \
   bdelima/ha-portainer-sidecar:latest
 ```
@@ -111,6 +120,8 @@ docker run -d \
 docker build -t ha-portainer-sidecar .
 docker run -d \
   -e HA_TOKEN="your-long-lived-access-token" \
+  -e AUTH_USERNAME="admin" \
+  -e AUTH_PASSWORD="choose-a-password" \
   -p 8000:8000 \
   ha-portainer-sidecar
 ```
@@ -136,13 +147,33 @@ not something a workflow file can do for itself):
 1. Docker Hub -> Account Settings -> Personal access tokens -> create one scoped to Read & Write for this repo.
 2. GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret, twice: `DOCKERHUB_USERNAME` (your Docker Hub username) and `DOCKERHUB_TOKEN` (the access token from step 1, not your Docker Hub password).
 
-## Security
+## Authentication
 
-**Do not expose this app publicly.** Anyone who can reach it can install container updates and delete Home Assistant devices through it, with no auth layer of its own beyond whatever you put in front of it. Put it behind a reverse proxy scoped to your LAN, a VPN, or an authenticating proxy (e.g. Tailscale, or an Nginx Proxy Manager host restricted by IP/access list) — never expose port 8000 to the public internet directly.
+The app has its own sign-in. It runs in one of three modes, chosen from the environment:
+
+| Mode | When | What happens |
+|---|---|---|
+| Sign-in required | `AUTH_USERNAME` and `AUTH_PASSWORD` are both set | Every page and `/api/*` call needs a session. Only `/healthz`, `/version` and `/login` are open. |
+| Anonymous | `AUTH_ALLOW_ANONYMOUS=true` | No checks. Meant for testing. A warning is logged at startup. |
+| Locked | none of the above (including only one of the pair) | Everything except `/healthz` and `/version` answers 503 with a message naming the variables, and an error is logged at startup. An install with no credentials fails closed instead of staying open. |
+
+There are two ways to sign in, and both end in the same session cookie (30 days, `HttpOnly`, `SameSite=Lax`, signed with a key derived from the password, so changing the password signs everyone out):
+
+- **The sign-in page** (`/login`), for a browser opened straight at this app. After 10 failed attempts from one address in 5 minutes it answers 429 for a while. Behind a reverse proxy every visitor shares the proxy's address, so those attempts are counted together.
+- **The Home Assistant sidebar panel.** The Portainer Maintenance integration's setup form asks for the same username and password (or "anonymous"). A Home Assistant iframe panel can pass nothing but a URL, so the integration adds `?auth=<token>` to it. The token is `HMAC-SHA256(key=password, "portainer-sidecar-panel:" + username)` in hex: it is not the password and cannot be turned back into it, but anyone who holds it can sign in until the password changes. The app swaps it for the session cookie and redirects to the same URL without it. Anyone Home Assistant lets open the panel therefore gets in, so keep the panel administrator-only (the integration's default).
+
+Things worth knowing:
+
+- The app does not check who you are in Home Assistant; it only checks the username and password above (or the token derived from them).
+- The cookie is only sent inside the Home Assistant iframe if Home Assistant and this app are on the same site (for example `ha.example.com` and `actions.example.com`). If they are on different sites, a browser that blocks third-party cookies will show the sign-in page inside the panel.
+- Over plain HTTP the credentials and cookie travel unencrypted. Put the app behind HTTPS (a reverse proxy that sends `X-Forwarded-Proto: https` makes the cookie `Secure`).
+- This is a single shared account. There is no user management and no sign-out button; clear the cookie or change the password.
+
+**Do not expose this app publicly.** Anyone who gets in can install container updates, restart Portainer and delete Home Assistant devices through it. The sign-in is a guard for a LAN or VPN, not a reason to publish port 8000: keep it behind a reverse proxy scoped to your LAN, a VPN, or an authenticating proxy, and never expose port 8000 to the public internet directly.
 
 ## Embedding in Home Assistant
 
-The [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration registers a sidebar panel pointing at this app's URL automatically as part of its own setup — no manual dashboard configuration needed. See that repo's README for the full installation flow.
+The [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration registers a sidebar panel pointing at this app's URL automatically as part of its own setup — no manual dashboard configuration needed. Its setup form asks for the same username and password as `AUTH_USERNAME`/`AUTH_PASSWORD` here (or "anonymous" when `AUTH_ALLOW_ANONYMOUS` is on) so the panel signs in by itself; see [Authentication](#authentication). See that repo's README for the full installation flow.
 
 ## License
 
