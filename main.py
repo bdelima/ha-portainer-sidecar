@@ -35,21 +35,39 @@ Environment variables:
                      secret with full API access as whichever HA user created
                      it. Pass it via an env file / Docker secret (or
                      HA_TOKEN_FILE, below), never bake it into the image.
+    AUTH_USERNAME,
+    AUTH_PASSWORD   Optional. Sign-in for this app's own web UI. Set both, and
+                     every request needs a session (see "Authentication"
+                     below). The Portainer Maintenance integration's setup form
+                     takes the same pair so its sidebar panel signs in by
+                     itself. With neither set (and AUTH_ALLOW_ANONYMOUS unset)
+                     the app is open to anyone who can reach it, as in earlier
+                     versions.
+    AUTH_ALLOW_ANONYMOUS
+                     Optional. true: no sign-in at all, even if the pair above
+                     is set. false: refuse to serve unless the pair is set.
+                     Unset: open when no pair is set, sign-in required when
+                     both are.
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import html
 import ipaddress
 import os
 import re
 import socket
 import time
 import uuid
+from urllib.parse import parse_qs, urlencode
 from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
 
@@ -191,6 +209,300 @@ SENSORS = {
 }
 
 app = FastAPI(title="Portainer Sidecar")
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+#
+# Three modes, picked from the environment (see _auth_mode):
+#   anonymous  No checks at all. This is the default when nothing is
+#              configured, so an install keeps working exactly as it did before
+#              sign-in existed, and also what AUTH_ALLOW_ANONYMOUS=true gives
+#              (which wins even over a username/password pair).
+#   required   AUTH_USERNAME and AUTH_PASSWORD both set. Every request except
+#              /healthz, /version and /login needs a valid session cookie.
+#   locked     A misconfiguration: only one of the pair set, or
+#              AUTH_ALLOW_ANONYMOUS=false with no pair. Nothing is served
+#              except /healthz and /version, with a message saying what to fix.
+#              Better to refuse than to guess which way the owner meant it.
+#
+# A session is a stateless signed cookie, so there is nothing to store: it is
+# "<expiry>.<HMAC>", keyed from the password, so changing the password signs
+# everyone out.
+#
+# Two ways in, both ending in that cookie:
+#   * /login, a plain username/password form (a browser opened directly).
+#   * ?auth=<panel token> on any page. The Portainer Maintenance integration
+#     appends this to the URL of its Home Assistant sidebar panel, because an
+#     HA iframe panel can pass nothing but a URL. The token is
+#     HMAC-SHA256(key=password, msg="portainer-sidecar-panel:" + username),
+#     so it is not the password and cannot be turned back into it, but anyone
+#     holding it can sign in. The integration computes the identical value
+#     (sidecar_auth.py there); change one side and change the other.
+# ---------------------------------------------------------------------------
+def _truthy(value: str | None) -> bool:
+    return (value or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+AUTH_USERNAME = os.environ.get("AUTH_USERNAME", "")
+AUTH_PASSWORD = os.environ.get("AUTH_PASSWORD", "")
+# None = not set (or blank), True/False = set explicitly.
+AUTH_ALLOW_ANONYMOUS: bool | None = (
+    _truthy(os.environ["AUTH_ALLOW_ANONYMOUS"])
+    if os.environ.get("AUTH_ALLOW_ANONYMOUS", "").strip()
+    else None
+)
+
+SESSION_COOKIE = "sidecar_session"
+SESSION_MAX_AGE = 30 * 24 * 3600
+# Probes that must keep working without a session (Docker healthcheck, version
+# checks from the README).
+PUBLIC_PATHS = frozenset({"/healthz", "/version"})
+
+_LOGIN_MAX_FAILURES = 10
+_LOGIN_WINDOW = 300.0
+_LOGIN_FAIL_DELAY = 1.0
+_LOGIN_FAILURES: dict[str, list[float]] = {}
+
+
+def _auth_mode() -> str:
+    if AUTH_ALLOW_ANONYMOUS:
+        return "anonymous"
+    if AUTH_USERNAME and AUTH_PASSWORD:
+        return "required"
+    if AUTH_USERNAME or AUTH_PASSWORD:
+        return "locked"  # only one of the pair
+    if AUTH_ALLOW_ANONYMOUS is None:
+        return "anonymous"  # nothing configured: open, as before sign-in existed
+    return "locked"  # AUTH_ALLOW_ANONYMOUS=false but no credentials to require
+
+
+def _locked_message() -> str:
+    if bool(AUTH_USERNAME) != bool(AUTH_PASSWORD):
+        return (
+            "Authentication is half configured: AUTH_USERNAME and AUTH_PASSWORD "
+            "must both be set."
+        )
+    return (
+        "AUTH_ALLOW_ANONYMOUS is false but no sign-in is configured. Set "
+        "AUTH_USERNAME and AUTH_PASSWORD in this container's environment, or "
+        "remove AUTH_ALLOW_ANONYMOUS (or set it to true) to allow "
+        "unauthenticated access, then restart it."
+    )
+
+
+def panel_token(username: str, password: str) -> str:
+    """The value the integration appends to the sidebar panel URL as ?auth=."""
+    return hmac.new(
+        password.encode("utf-8"),
+        b"portainer-sidecar-panel:" + username.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _session_sig(exp: int) -> str:
+    key = hashlib.sha256(b"portainer-sidecar-session:" + AUTH_PASSWORD.encode("utf-8")).digest()
+    return hmac.new(key, f"{AUTH_USERNAME}:{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _make_session() -> str:
+    exp = int(time.time()) + SESSION_MAX_AGE
+    return f"{exp}.{_session_sig(exp)}"
+
+
+def _session_valid(value: str) -> bool:
+    try:
+        exp_text, sig = value.split(".", 1)
+        exp = int(exp_text)
+    except ValueError:
+        return False
+    if exp < time.time():
+        return False
+    return hmac.compare_digest(sig.encode("utf-8"), _session_sig(exp).encode("utf-8"))
+
+
+def _credentials_ok(username: str, password: str) -> bool:
+    # Both comparisons always run, so timing does not reveal which was wrong.
+    user_ok = hmac.compare_digest(username.encode("utf-8"), AUTH_USERNAME.encode("utf-8"))
+    pass_ok = hmac.compare_digest(password.encode("utf-8"), AUTH_PASSWORD.encode("utf-8"))
+    return user_ok and pass_ok
+
+
+def _safe_next(value: str | None) -> str:
+    """Only a same-site path may be redirected to after sign-in."""
+    if (
+        not value
+        or not value.startswith("/")
+        or value.startswith("//")
+        or "\\" in value
+        or any(ord(c) < 32 for c in value)
+    ):
+        return "/"
+    return value
+
+
+def _set_session_cookie(response: Any, request: Request) -> None:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    secure = proto == "https" or request.url.scheme == "https"
+    # SameSite=Lax: the cookie is not sent on cross-site POSTs, so another
+    # website cannot drive the action endpoints with it. It does travel inside
+    # the Home Assistant iframe as long as HA and this app are on the same
+    # site (for example ha.example.com and sidecar.example.com).
+    response.set_cookie(
+        SESSION_COOKIE,
+        _make_session(),
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path="/",
+    )
+
+
+def _recent_failures(ip: str) -> list[float]:
+    now = time.time()
+    recent = [t for t in _LOGIN_FAILURES.get(ip, []) if now - t < _LOGIN_WINDOW]
+    if recent:
+        _LOGIN_FAILURES[ip] = recent
+    else:
+        _LOGIN_FAILURES.pop(ip, None)
+    return recent
+
+
+def _record_failure(ip: str) -> None:
+    if len(_LOGIN_FAILURES) > 1000:
+        _LOGIN_FAILURES.clear()
+    _LOGIN_FAILURES.setdefault(ip, []).append(time.time())
+
+
+_PAGE_STYLE = (
+    "body{font-family:system-ui,sans-serif;margin:0;min-height:100vh;display:flex;"
+    "align-items:center;justify-content:center;background:#f4f5f7;color:#1b1f24}"
+    "form,.box{background:#fff;padding:24px;border-radius:10px;width:min(320px,90vw);"
+    "box-shadow:0 1px 6px rgba(0,0,0,.15)}"
+    "h1{font-size:18px;margin:0 0 16px}label{display:block;font-size:13px;margin:12px 0 4px}"
+    "input{width:100%;box-sizing:border-box;padding:8px;font-size:15px;border:1px solid #9aa4af;"
+    "border-radius:6px;background:#fff;color:inherit}"
+    "button{margin-top:18px;width:100%;padding:9px;font-size:15px;border:0;border-radius:6px;"
+    "background:#1b6ef3;color:#fff;cursor:pointer}.err{color:#c62828;font-size:13px;margin-top:12px}"
+    "@media(prefers-color-scheme:dark){body{background:#111418;color:#e6e9ed}"
+    "form,.box{background:#1c2026}input{background:#111418;border-color:#4a5360}}"
+)
+
+
+def _login_html(next_path: str, error: str = "") -> str:
+    err = f'<div class="err">{html.escape(error)}</div>' if error else ""
+    return (
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>Portainer Sidecar: sign in</title><style>{_PAGE_STYLE}</style></head><body>"
+        '<form method="post" action="/login"><h1>Portainer Sidecar</h1>'
+        f'<input type="hidden" id="next" name="next" value="{html.escape(next_path, quote=True)}">'
+        '<label for="u">Username</label>'
+        '<input id="u" name="username" autocomplete="username" autofocus required>'
+        '<label for="p">Password</label>'
+        '<input id="p" name="password" type="password" autocomplete="current-password" required>'
+        f'<button type="submit">Sign in</button>{err}</form>'
+        # A #fragment on the original link (a notification deep link such as
+        # #needs-remediation) survives the redirect to this page but not the
+        # form post, so it is added back to the target here.
+        "<script>var n=document.getElementById('next');"
+        "if(location.hash&&n.value.indexOf('#')<0)n.value+=location.hash;</script>"
+        "</body></html>"
+    )
+
+
+def _locked_response(request: Request) -> Any:
+    message = _locked_message()
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"detail": message}, status_code=503)
+    return HTMLResponse(
+        '<!doctype html><html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>Portainer Sidecar</title><style>{_PAGE_STYLE}</style></head><body>"
+        f'<div class="box"><h1>Portainer Sidecar</h1><p>{html.escape(message)}</p></div></body></html>',
+        status_code=503,
+    )
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    """Defined before _no_cache so that one wraps this: sign-in redirects and
+    401s are marked no-store too."""
+    path = request.url.path
+    if path in PUBLIC_PATHS:
+        return await call_next(request)
+    mode = _auth_mode()
+    if mode == "anonymous":
+        if path == "/login":
+            return RedirectResponse("/", status_code=303)
+        return await call_next(request)
+    if mode == "locked":
+        return _locked_response(request)
+    if path == "/login":
+        return await call_next(request)
+    if _session_valid(request.cookies.get(SESSION_COOKIE, "")):
+        return await call_next(request)
+    token = request.query_params.get("auth")
+    if (
+        request.method == "GET"
+        and token
+        and hmac.compare_digest(token.encode("utf-8"), panel_token(AUTH_USERNAME, AUTH_PASSWORD).encode("utf-8"))
+    ):
+        rest = [(k, v) for k, v in request.query_params.multi_items() if k != "auth"]
+        target = path + ("?" + urlencode(rest) if rest else "")
+        response = RedirectResponse(target, status_code=303)
+        _set_session_cookie(response, request)
+        return response
+    if path.startswith("/api/"):
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    target = path + ("?" + request.url.query if request.url.query else "")
+    return RedirectResponse("/login?" + urlencode({"next": target}), status_code=303)
+
+
+@app.on_event("startup")
+async def _log_auth_mode() -> None:
+    mode = _auth_mode()
+    if mode == "anonymous" and AUTH_ALLOW_ANONYMOUS:
+        print("[startup] AUTH_ALLOW_ANONYMOUS is true: this app is serving WITHOUT authentication")
+    elif mode == "anonymous":
+        print(
+            "[startup] No sign-in configured: this app is serving WITHOUT authentication. "
+            "Set AUTH_USERNAME and AUTH_PASSWORD to require one."
+        )
+    elif mode == "locked":
+        print(f"[startup] ERROR: {_locked_message()} Serving only /healthz and /version.")
+    else:
+        print(f"[startup] Authentication required (user {AUTH_USERNAME!r})")
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(next: str = "/") -> HTMLResponse:
+    return HTMLResponse(_login_html(_safe_next(next)))
+
+
+@app.post("/login")
+async def login_submit(request: Request) -> Any:
+    ip = request.client.host if request.client else "unknown"
+    if len(_recent_failures(ip)) >= _LOGIN_MAX_FAILURES:
+        return HTMLResponse(_login_html("/", "Too many failed attempts. Try again in a few minutes."), status_code=429)
+    body = b""
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > 4096:
+            raise HTTPException(status_code=413, detail="Request too large")
+    form = parse_qs(body.decode("utf-8", "replace"))
+    username = form.get("username", [""])[0]
+    password = form.get("password", [""])[0]
+    next_path = _safe_next(form.get("next", ["/"])[0])
+    if _credentials_ok(username, password):
+        _LOGIN_FAILURES.pop(ip, None)
+        response = RedirectResponse(next_path, status_code=303)
+        _set_session_cookie(response, request)
+        return response
+    _record_failure(ip)
+    await asyncio.sleep(_LOGIN_FAIL_DELAY)
+    return HTMLResponse(_login_html(next_path, "Wrong username or password."), status_code=401)
 
 
 @app.middleware("http")
@@ -499,12 +811,13 @@ class RestartStackRequest(BaseModel):
     @field_validator("switch_entity_id")
     @classmethod
     def _must_be_a_switch_entity(cls, value: str) -> str:
-        # This app has no auth of its own (see README "Security"), same as
-        # every other endpoint here -- this isn't a security boundary, just
-        # a cheap sanity check against a stray non-switch entity_id (e.g. a
-        # typo, or a stale value from state.stackRestartEntries) reaching
-        # the portainer_maintenance.restart_stack service, which itself
-        # just does cv.entity_id and would happily stop/start whatever
+        # Not a security boundary (whether this endpoint needs a sign-in is
+        # decided by the auth gate near the top of this file, see README
+        # "Authentication"), just a cheap sanity check against a stray
+        # non-switch entity_id (e.g. a typo, or a stale value from
+        # state.stackRestartEntries) reaching the
+        # portainer_maintenance.restart_stack service, which itself just
+        # does cv.entity_id and would happily stop/start whatever
         # entity_id it's handed.
         if not value.startswith("switch."):
             raise ValueError("switch_entity_id must be a switch.* entity")
