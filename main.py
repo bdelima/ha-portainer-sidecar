@@ -624,6 +624,37 @@ async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
     return {"ok": True}
 
 
+class DismissRequest(BaseModel):
+    dismiss_key: str
+
+    @field_validator("dismiss_key")
+    @classmethod
+    def _check_key(cls, value: str) -> str:
+        # Keys are "<kind>:<identity>" as built by the integration's trouble
+        # sensor. This is only a sanity check so an arbitrary string can't
+        # be stored in the integration's dismissal file; the integration
+        # re-validates it too.
+        value = value.strip()
+        if ":" not in value or len(value) > 256:
+            raise ValueError("dismiss_key must look like '<kind>:<id>'")
+        return value
+
+
+@app.post("/api/actions/dismiss")
+async def dismiss_trouble_item(payload: DismissRequest) -> dict[str, Any]:
+    """Hides one Needs Remediation item the user can't act on from here.
+    Delegates to portainer_maintenance.dismiss_trouble_item (HA side),
+    which owns how long a dismissal lasts. Needs an integration version
+    that has that service; an older one answers 502 here."""
+    try:
+        await ha_call_service(
+            "portainer_maintenance", "dismiss_trouble_item", {"dismiss_key": payload.dismiss_key}
+        )
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"dismiss failed: {exc}") from exc
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------------
 # Changelog (1.3.8) -- fetches a repo's latest GitHub release notes
 # server-side and serves them from this app's own origin, so the frontend
