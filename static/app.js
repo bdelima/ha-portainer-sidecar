@@ -1310,7 +1310,7 @@ function renderCleanupRows() {
     // pyportainer 1.0.47 or later; before that Docker never saw the filter.
     const specs = {
       dangling: {
-        note: "Removes only untagged images that no container uses. An image left behind after an update is not always untagged; if it is still listed afterwards, use “Prune unused images”. Needs Home Assistant 2026.10 or later.",
+        note: "Removes only untagged images that no container uses, which includes the old image an update leaves behind. “Prune unused images” also removes tagged ones. Needs Home Assistant 2026.10 or later.",
         badgeText: null,
         confirm: `Remove every dangling (untagged, unused) image on ${ep.host}? This cannot be undone.`,
         run: () => pruneImages(true, null, [ep.device_id]),
