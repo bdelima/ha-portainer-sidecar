@@ -951,18 +951,6 @@ function renderUpdatesRows() {
 // "kind" values this renders.
 // ---------------------------------------------------------------------
 
-function troubleViewLink(item) {
-  if (!state.haBaseUrl || !item.entity) return null;
-  const link = document.createElement("a");
-  link.href = `${state.haBaseUrl}/history?entity_id=${encodeURIComponent(item.entity)}`;
-  link.target = "_blank";
-  link.rel = "noopener";
-  link.className = "row-action-btn";
-  link.style.textDecoration = "none";
-  link.textContent = "View";
-  return wireExternalLink(link);
-}
-
 // (1.3.1) Persistent inline error under a stack's header row after a
 // failed "Restart Stack Now" -- shown regardless of the stack's own
 // expand/collapse state, since this is the one failure in the app that
@@ -988,15 +976,29 @@ function renderTroubleChildRow(item, indentLevel) {
   const tdStatus = document.createElement("td");
   tdStatus.innerHTML = `<span class="row-secondary">${escapeHtml(item.secondary_info || "")}</span>`;
 
-  if (item.kind === "unstacked_recreate") {
-    const btn = document.createElement("button");
-    btn.className = "row-action-btn";
-    btn.textContent = "More Info";
-    btn.addEventListener("click", () => showInfoDialog(item.name, item.detail || item.secondary_info || ""));
-    tdStatus.appendChild(btn);
-  } else {
-    const link = troubleViewLink(item);
-    if (link) tdStatus.appendChild(link);
+  // Most Trouble items can only be fixed on the host, so there is nothing
+  // to open or run from here. Rows get only what applies:
+  //   - More Info, when the integration sent a `detail` describing a manual
+  //     remediation (unstacked_recreate, portainer_self_update);
+  //   - Dismiss, when it sent a `dismiss_key` (an older integration doesn't,
+  //     so those rows simply have no button).
+  // Endpoint and stuck-stack items keep their actions on the group header.
+  if (item.detail) {
+    const info = document.createElement("button");
+    info.className = "row-action-btn";
+    info.textContent = "More Info";
+    info.addEventListener("click", () => showInfoDialog(item.name, item.detail));
+    tdStatus.appendChild(info);
+  }
+  if (item.dismiss_key) {
+    const pendingKey = `dismiss:${item.dismiss_key}`;
+    const pending = isPending(pendingKey);
+    const dismiss = document.createElement("button");
+    dismiss.className = "row-action-btn";
+    dismiss.textContent = pending ? "Dismissing…" : "Dismiss";
+    dismiss.disabled = pending;
+    dismiss.addEventListener("click", () => runPending(pendingKey, () => dismissTroubleItem(item.dismiss_key)));
+    tdStatus.appendChild(dismiss);
   }
 
   tr.append(tdName, tdStatus);
@@ -1735,6 +1737,30 @@ async function reloadEndpoint(deviceId) {
     console.error(e);
   }
   loadActionItems();
+}
+
+async function dismissTroubleItem(dismissKey) {
+  try {
+    const res = await fetch("/api/actions/dismiss", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dismiss_key: dismissKey }),
+    });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch {
+        // Response wasn't JSON -- fall through with just the status.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    showToast("Dismissed");
+  } catch (e) {
+    showToast(`Dismiss failed — ${e.message}`);
+    console.error(e);
+  }
+  await loadActionItems();
 }
 
 function confirmDeleteSelected() {
