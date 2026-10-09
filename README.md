@@ -42,6 +42,7 @@ It's a two-piece app: a small FastAPI backend that holds a Home Assistant long-l
   - *(1.3.12)* `#needs-remediation` now works the same way (aliased onto the same tab — see the 1.3.12 note above), since that's the hash the integration's trouble notification links to as of its own 1.3.5 release.
 - **Colored tab badges** *(1.3.2)*: each tab's count badge now turns a distinct color the moment it's non-zero — blue for Updates, red for Trouble, orange for Stale and Cleanup — as a quick "something here needs a look" cue, and returns to the neutral dark pill once that tab is back to zero. The active tab's own highlighting (its text color and underline) is unchanged; its badge just no longer gets forced blue regardless of which tab that actually is.
 - Polls for updates every 15 seconds.
+- **Useful logs** *(unreleased)*: the container log now says what happened and why, not just which URL was hit. Every action (install, restart stack, delete stale devices, prune, reload endpoint, dismiss, update Portainer) logs what it was asked to do, the result, how long it took and, when Home Assistant refused, Home Assistant's own error text; sign-ins, failed sign-ins and rate limiting are logged; and a Home Assistant outage is logged once when it starts and once when it ends instead of every 15-second poll. See [Logging](#logging).
 - **Optional sign-in** *(unreleased)*: the app can now have a login of its own. Set `AUTH_USERNAME` and `AUTH_PASSWORD` and every page and `/api/*` call needs a session; the Portainer Maintenance integration's setup form takes the same pair so its Home Assistant sidebar panel signs in by itself. **Nothing changes unless you set them:** with none of the `AUTH_*` variables set the app stays open to anyone who can reach it, exactly as before. See [Authentication](#authentication).
 
 This app doesn't create those sensors or those services itself — see the [Portainer Maintenance](https://github.com/bdelima/ha-portainer-dashboard) integration, which this app is designed to pair with.
@@ -60,6 +61,7 @@ This app itself has no Home Assistant version dependency of its own — it only 
 | `AUTH_USERNAME` | No (set with `AUTH_PASSWORD`) | Username for the web UI's sign-in. Setting only one of the pair makes the app refuse to serve. See [Authentication](#authentication). |
 | `AUTH_PASSWORD` | No (set with `AUTH_USERNAME`) | Password for the web UI's sign-in. Keeping it in the compose file is fine for a LAN tool: that file is already access-controlled (in Portainer, for example). |
 | `AUTH_ALLOW_ANONYMOUS` | No | `true` turns sign-in off even if the pair is set. `false` makes the app refuse to serve unless the pair is set. Unset (the default) means: open when there is no pair, sign-in required when there is. |
+| `LOG_LEVEL` | No | `DEBUG`, `INFO` (default), `WARNING` or `ERROR`: how much the app writes to the container log. See [Logging](#logging). |
 
 ### Auto-discovery
 
@@ -169,6 +171,29 @@ Things worth knowing:
 - This is a single shared account. There is no user management and no sign-out button; clear the cookie or change the password.
 
 **Do not expose this app publicly.** Anyone who gets in can install container updates, restart Portainer and delete Home Assistant devices through it. The app is open by default, and even with sign-in on it is a guard for a LAN or VPN, not a reason to publish port 8000: keep it behind a reverse proxy scoped to your LAN, a VPN, or an authenticating proxy, and never expose port 8000 to the public internet directly.
+
+## Logging
+
+The app writes to stdout, so `docker logs ha-portainer-sidecar` shows it. uvicorn's own access lines (`POST /api/actions/update-portainer ... 502 Bad Gateway`) are still there; the app's lines say why. Each line is `time level logger: message`:
+
+```
+2026-10-09 07:41:12 INFO    sidecar.action: install started 'update.dozzle_image_update' (job 3f9a1c2e, waited 0.0s in the 'abc123' queue)
+2026-10-09 07:41:19 INFO    sidecar.action: install ok 'update.dozzle_image_update' (job 3f9a1c2e) (7.2s)
+2026-10-09 07:44:03 WARNING sidecar.action: update_portainer FAILED 'update.portainer_image_update': HTTP 500: No update is pending for update.portainer_image_update (0.1s)
+2026-10-09 07:50:31 WARNING sidecar.auth: failed sign-in from 172.18.0.5 (3 of 10 allowed in 300 s)
+```
+
+| Logger | What it covers |
+|---|---|
+| `sidecar` | startup (version, log level, which Home Assistant address is in use), Home Assistant becoming unreachable and reachable again, failed changelog lookups |
+| `sidecar.auth` | the authentication mode at startup, successful sign-ins (password or panel token), failed sign-ins, a wrong panel token, rate limiting. Unauthenticated `/api/*` calls are logged at `DEBUG` only, since a browser tab left open after its session expired would repeat one every 15 seconds. |
+| `sidecar.action` | every action a user triggers: what was asked, the result, how long it took, and Home Assistant's error text on failure. Deleting a stale device logs each device id as it is removed, because there is no undo. |
+
+`LOG_LEVEL=DEBUG` adds the unauthenticated-request lines and the best-effort "dismiss the bell notification" failures; `WARNING` keeps only failures and auth problems.
+
+**What is never logged, at any level:** passwords (submitted or configured), `HA_TOKEN`, session cookies, the `?auth=` panel token, and the username typed into a failed sign-in (people paste passwords into that box). Anything a client sends (entity ids, device ids, headers) is quoted and clipped so it can't forge a log line. The sign-in address is the socket address uvicorn saw; behind a reverse proxy that is the proxy, so `X-Forwarded-For` is added when present, labelled as a claim because anyone can send it.
+
+**One thing this does not change:** uvicorn's access log records the full request line, so a request to `/?auth=<panel token>` writes the token to the log. Treat the container log with the same care as the compose file that holds `AUTH_PASSWORD`.
 
 ## Embedding in Home Assistant
 
