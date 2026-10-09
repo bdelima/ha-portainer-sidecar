@@ -207,8 +207,18 @@ h1 {
 
 .col-check { width: 36px; }
 
-.row-name { font-weight: 500; }
-.row-secondary { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
+/* overflow-wrap: anywhere (unlike break-word) also lowers the column's minimum
+   width, so a long unbroken name such as immich_machine_learning wraps in a
+   narrow column instead of widening the table past the panel and pushing the
+   buttons off the right edge. */
+.row-name { font-weight: 500; overflow-wrap: anywhere; }
+.row-secondary { color: var(--muted); font-size: 0.8rem; margin-top: 2px; overflow-wrap: anywhere; }
+/* Phone width: a little less horizontal padding in the tables, so the name
+   column and the buttons both fit inside the panel. */
+@media (max-width: 480px) {
+  .item-table th,
+  .item-table td { padding-left: 8px; padding-right: 8px; }
+}
 
 /* Buttons in a Trouble row's Status cell: a spaced group instead of bare
    floated buttons. row-reverse keeps the order the floats gave them (first
@@ -221,6 +231,15 @@ h1 {
   gap: 8px;
 }
 .row-actions .row-action-btn { white-space: nowrap; }
+/* The Updates tab's Changelog button/link sits in the same group. As a loose
+   float it carried a right margin to space it from Install; the group's gap
+   does that now, and the margin would only skew the column on a phone. */
+.row-actions .row-changelog-link {
+  float: none;
+  margin-right: 0;
+  white-space: nowrap;
+  text-align: center;
+}
 /* Phone width: one tidy column of equal-width buttons (top to bottom in
    reading order) rather than a ragged wrapped row. */
 @media (max-width: 480px) {
