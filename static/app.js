@@ -42,6 +42,9 @@ const state = {
   // this set instead means every render(), however triggered, reflects
   // reality.
   pendingActions: new Set(),
+  // dismiss_key -> time it was clicked, for Trouble rows hidden optimistically
+  // (see dismissTroubleItem / troubleView).
+  dismissedTrouble: new Map(),
   // (1.3.1) A failed "Restart Stack Now" gets a persistent inline error on
   // the Trouble tab's stack row, not just a toast -- this is the one action
   // in the whole app where a silent failure is actively misleading (tap it,
@@ -424,6 +427,7 @@ async function loadActionItems() {
     const res = await fetch("/api/action-items");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     state.data = await res.json();
+    pruneDismissedTrouble();
     pruneSelection();
     pruneStackRestartErrors();
     pruneInstallResults();
@@ -445,9 +449,11 @@ function pruneSelection() {
   for (const id of [...state.selection.stale]) {
     if (!staleIds.has(id)) state.selection.stale.delete(id);
   }
-  const cleanupDevices = new Set((state.data.cleanup.items || []).map((ep) => ep.device_id).filter(Boolean));
+  // Also drops a tick whose row has become unavailable since (the endpoint's
+  // last image was pruned, so its image rows are now disabled).
+  const cleanupSelectable = new Set((state.data.cleanup.items || []).flatMap((ep) => cleanupSelectableIds(ep)));
   for (const id of [...state.selection.cleanup]) {
-    if (!cleanupDevices.has(cleanupSelDevice(id))) state.selection.cleanup.delete(id);
+    if (!cleanupSelectable.has(id)) state.selection.cleanup.delete(id);
   }
 }
 
@@ -514,9 +520,36 @@ function setTabCount(id, tabKey, count) {
   }
 }
 
+// How long a dismissed Trouble row stays hidden while the server still lists
+// it. Normally the next refresh drops it (the integration refreshes right
+// after a dismiss); this cap only matters if it never does, so the row comes
+// back rather than staying hidden against what the server says.
+const DISMISS_HOLD_MS = 120000;
+
+// Forget dismissed keys the server has stopped listing, or has listed for
+// longer than DISMISS_HOLD_MS. Run on fresh data, before it is displayed.
+function pruneDismissedTrouble() {
+  const listed = new Set((state.data.trouble.items || []).map((i) => i.dismiss_key).filter(Boolean));
+  const now = Date.now();
+  for (const [key, at] of [...state.dismissedTrouble]) {
+    if (!listed.has(key) || now - at > DISMISS_HOLD_MS) state.dismissedTrouble.delete(key);
+  }
+}
+
+// The Trouble data as displayed: the server's list minus rows dismissed here
+// and not yet confirmed gone, with the count adjusted to match.
+function troubleView() {
+  const raw = state.data.trouble;
+  const items = raw.items || [];
+  if (state.dismissedTrouble.size === 0) return { count: raw.count, items };
+  const kept = items.filter((i) => !(i.dismiss_key && state.dismissedTrouble.has(i.dismiss_key)));
+  return { count: Math.max(0, raw.count - (items.length - kept.length)), items: kept };
+}
+
 function render() {
+  const trouble = troubleView();
   setTabCount("count-updates", "updates", state.data.updates.count);
-  setTabCount("count-trouble", "trouble", state.data.trouble.count);
+  setTabCount("count-trouble", "trouble", trouble.count);
   setTabCount("count-stale", "stale", state.data.stale.count);
   // (1.3.0) Cleanup's sensor state is a running SUM of the per-endpoint
   // unused-image estimate, not an item count -- see sensor.py's
@@ -526,7 +559,7 @@ function render() {
   setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
 
   const totalCount =
-    state.data.updates.count + state.data.trouble.count + state.data.stale.count + state.data.cleanup.count;
+    state.data.updates.count + trouble.count + state.data.stale.count + state.data.cleanup.count;
   el("empty-state").hidden = totalCount !== 0;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.hidden = totalCount === 0 || panel.dataset.panel !== state.activeTab;
@@ -978,9 +1011,15 @@ function renderTroubleChildRow(item, indentLevel) {
   const tr = document.createElement("tr");
   const tdName = document.createElement("td");
   const indentClass = indentLevel === 2 ? "row-name-indent-2" : indentLevel === 1 ? "row-name-indent" : "";
-  tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+  // The description sits on its own line under the name, indented with it,
+  // so the Status cell is free for the buttons (on a phone the two used to
+  // fight over one narrow column).
+  let nameHtml = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+  if (item.secondary_info) nameHtml += `<div class="row-secondary ${indentClass}">${escapeHtml(item.secondary_info)}</div>`;
+  tdName.innerHTML = nameHtml;
   const tdStatus = document.createElement("td");
-  tdStatus.innerHTML = `<span class="row-secondary">${escapeHtml(item.secondary_info || "")}</span>`;
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
 
   // Most Trouble items can only be fixed on the host, so there is nothing
   // to open or run from here. Rows get only what applies:
@@ -994,7 +1033,7 @@ function renderTroubleChildRow(item, indentLevel) {
     info.className = "row-action-btn";
     info.textContent = "More Info";
     info.addEventListener("click", () => showInfoDialog(item.name, item.detail));
-    tdStatus.appendChild(info);
+    actions.appendChild(info);
   }
   // Update now: only for a Portainer server/agent update the integration
   // says it can start itself (`update_now`; an older integration doesn't
@@ -1015,18 +1054,18 @@ function renderTroubleChildRow(item, indentLevel) {
         () => runPending(pendingKey, () => updatePortainer(item.entity)),
       ),
     );
-    tdStatus.appendChild(upd);
+    actions.appendChild(upd);
   }
+  // Dismiss changes no state anywhere except "hide this row", so the row goes
+  // at once and the request runs in the background (see dismissTroubleItem).
   if (item.dismiss_key) {
-    const pendingKey = `dismiss:${item.dismiss_key}`;
-    const pending = isPending(pendingKey);
     const dismiss = document.createElement("button");
     dismiss.className = "row-action-btn";
-    dismiss.textContent = pending ? "Dismissing…" : "Dismiss";
-    dismiss.disabled = pending;
-    dismiss.addEventListener("click", () => runPending(pendingKey, () => dismissTroubleItem(item.dismiss_key)));
-    tdStatus.appendChild(dismiss);
+    dismiss.textContent = "Dismiss";
+    dismiss.addEventListener("click", () => dismissTroubleItem(item.dismiss_key));
+    actions.appendChild(dismiss);
   }
+  if (actions.childElementCount > 0) tdStatus.appendChild(actions);
 
   tr.append(tdName, tdStatus);
   return tr;
@@ -1035,7 +1074,7 @@ function renderTroubleChildRow(item, indentLevel) {
 function renderTroubleRows() {
   const tbody = el("rows-trouble");
   tbody.innerHTML = "";
-  const items = state.data.trouble.items || [];
+  const items = troubleView().items;
   if (items.length === 0) {
     tbody.appendChild(emptyRow(2, "Nothing in trouble."));
     return;
@@ -1260,6 +1299,21 @@ const CLEANUP_ACTIONS = [
   { id: "volumes", label: "Prune unused volumes", short: "unused volumes", pendingKey: (d) => `cleanup-volumes:${d}` },
 ];
 
+// An endpoint with no images at all has nothing for either image prune to do,
+// so both are disabled (and can't be ticked or batch-run). `images_count` is
+// the endpoint's total image count (dangling ones included) from core's own
+// images-count sensor; a dashboard integration too old to send it, or an
+// unknown value, leaves the rows enabled. Volumes are not affected.
+function cleanupActionDisabled(ep, actionId) {
+  return (actionId === "dangling" || actionId === "unused") && ep.images_count === 0;
+}
+
+// The tick ids a row, header or "select all" may set for this endpoint.
+function cleanupSelectableIds(ep) {
+  if (!ep.device_id) return [];
+  return CLEANUP_ACTIONS.filter((a) => !cleanupActionDisabled(ep, a.id)).map((a) => cleanupSelId(ep.device_id, a.id));
+}
+
 function cleanupSelId(deviceId, actionId) {
   return `${deviceId}|${actionId}`;
 }
@@ -1280,7 +1334,7 @@ function mibToCompactGb(mib) {
 // `pending` is this row's own action running (its button reads pendingText);
 // `disabled` additionally greys the button out without changing its text, for
 // when a different action on the same endpoint is running. `checkbox` is
-// { checked, onChange } or null (an endpoint with no device_id can't be
+// { checked, disabled, onChange } or null (an endpoint with no device_id can't be
 // selected for a batch).
 function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingText, pending, disabled, indent, checkbox, onClick }) {
   const tr = document.createElement("tr");
@@ -1291,6 +1345,7 @@ function renderCleanupActionRow({ label, note, badgeText, buttonText, pendingTex
     const cb = document.createElement("input");
     cb.type = "checkbox";
     cb.checked = checkbox.checked;
+    cb.disabled = !!checkbox.disabled;
     cb.addEventListener("change", () => checkbox.onChange(cb.checked));
     tdCheck.appendChild(cb);
   }
@@ -1330,7 +1385,7 @@ function renderCleanupRows() {
 
   for (const ep of sorted) {
     const epKey = ep.device_id || ep.host;
-    const epSelIds = ep.device_id ? CLEANUP_ACTIONS.map((a) => cleanupSelId(ep.device_id, a.id)) : [];
+    const epSelIds = cleanupSelectableIds(ep);
     if (!singleEndpoint) {
       const epExpanded = !state.collapsedEndpoints.has(`cleanup::${epKey}`);
       const allTicked = epSelIds.length > 0 && epSelIds.every((id) => sel.has(id));
@@ -1365,9 +1420,10 @@ function renderCleanupRows() {
     }
 
     const indent = !singleEndpoint;
+    const noImages = ep.images_count === 0;
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const unusedRowBadge = [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+    const unusedRowBadge = noImages ? "no images" : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     // All three actions on one endpoint go through the same Portainer
     // connection and the same Cleanup refresh, so while any one is running the
@@ -1381,7 +1437,7 @@ function renderCleanupRows() {
     const specs = {
       dangling: {
         note: "Removes only untagged images that no container uses, which includes the old image an update leaves behind. “Prune unused images” also removes tagged ones. Needs Home Assistant 2026.10 or later.",
-        badgeText: null,
+        badgeText: noImages ? "no images" : null,
         confirm: `Remove every dangling (untagged, unused) image on ${ep.host}? This cannot be undone.`,
         run: () => pruneImages(true, null, [ep.device_id]),
       },
@@ -1403,6 +1459,7 @@ function renderCleanupRows() {
       const spec = specs[action.id];
       const pendingKey = action.pendingKey(ep.device_id);
       const selId = ep.device_id ? cleanupSelId(ep.device_id, action.id) : null;
+      const unavailable = cleanupActionDisabled(ep, action.id);
       tbody.appendChild(
         renderCleanupActionRow({
           label: action.label,
@@ -1411,9 +1468,9 @@ function renderCleanupRows() {
           buttonText: "Prune",
           pendingText: "Pruning…",
           pending: isPending(pendingKey),
-          disabled: endpointBusy,
+          disabled: endpointBusy || unavailable,
           indent,
-          checkbox: selId ? { checked: sel.has(selId), onChange: (checked) => toggleSelection("cleanup", selId, checked) } : null,
+          checkbox: selId ? { checked: !unavailable && sel.has(selId), disabled: unavailable, onChange: (checked) => toggleSelection("cleanup", selId, checked) } : null,
           onClick: () => {
             showConfirmDialog(spec.confirm, "Prune", () => runPending(pendingKey, spec.run));
           },
@@ -1475,7 +1532,7 @@ function selectAll(category, checked) {
   if (checked) {
     for (const item of items) {
       if (category === "cleanup") {
-        if (item.device_id) for (const a of CLEANUP_ACTIONS) state.selection.cleanup.add(cleanupSelId(item.device_id, a.id));
+        for (const id of cleanupSelectableIds(item)) state.selection.cleanup.add(id);
         continue;
       }
       const id = category === "stale" ? staleDeviceId(item) : item.entity;
@@ -1799,7 +1856,16 @@ async function reloadEndpoint(deviceId) {
   loadActionItems();
 }
 
+// Dismiss is optimistic: the only thing it changes is whether the row is
+// listed, so the row is hidden the moment it is clicked and the request runs
+// behind it. There is no "Dismissing…" state to revert, which is what made the
+// button flicker back before the next refresh. `state.dismissedTrouble` keeps
+// it hidden until the server stops listing it (the integration refreshes a
+// moment after the request, so a poll in between can still list it); a
+// failure removes the key again so the row comes back, with a toast.
 async function dismissTroubleItem(dismissKey) {
+  state.dismissedTrouble.set(dismissKey, Date.now());
+  render();
   try {
     const res = await fetch("/api/actions/dismiss", {
       method: "POST",
@@ -1815,10 +1881,12 @@ async function dismissTroubleItem(dismissKey) {
       }
       throw new Error(detail || `HTTP ${res.status}`);
     }
-    showToast("Dismissed");
   } catch (e) {
+    state.dismissedTrouble.delete(dismissKey);
+    render();
     showToast(`Dismiss failed — ${e.message}`);
     console.error(e);
+    return;
   }
   await loadActionItems();
 }
@@ -1927,11 +1995,13 @@ async function pruneVolumes(deviceIds) {
 // Where "unused images" is ticked, "dangling images" is not run on its own: it
 // is a subset, so a second pass would only repeat the same work.
 function cleanupBatchPlan(ids) {
-  const hosts = new Map((state.data.cleanup.items || []).map((ep) => [ep.device_id, ep.host]));
+  const endpoints = new Map((state.data.cleanup.items || []).map((ep) => [ep.device_id, ep]));
+  const hosts = new Map([...endpoints].map(([device, ep]) => [device, ep.host]));
   const perDevice = new Map();
   for (const id of ids) {
     const device = cleanupSelDevice(id);
     if (!hosts.has(device)) continue;
+    if (cleanupActionDisabled(endpoints.get(device), cleanupSelAction(id))) continue;
     if (!perDevice.has(device)) perDevice.set(device, new Set());
     perDevice.get(device).add(cleanupSelAction(id));
   }
@@ -2096,9 +2166,32 @@ const initialTab = tabFromHash();
 if (initialTab) activateTab(initialTab);
 
 loadConfig();
-// Opening the dashboard counts as having read Home Assistant's "Portainer is
-// reporting ..." bell notification, so ask the backend to dismiss it. Best
-// effort: nothing here depends on the answer.
-fetch("/api/panel-opened", { method: "POST" }).catch(() => {});
+// Having the dashboard in front of the person counts as having read Home
+// Assistant's "Portainer is reporting ..." bell notification, so tell the
+// backend, which dismisses that one notification (and only that one; the
+// update-result and other notifications stay until the person dismisses
+// them). Best effort: nothing here depends on the answer.
+//
+// Page load alone missed two cases: a dashboard that was already open (the
+// "open dashboard" link only switches to it), and a notification that is
+// raised while the dashboard sits open. So it is also sent when the page
+// becomes visible or regains focus, and on every refresh while it is visible.
+// A hidden page never sends it, so nobody "reads" the notification from a
+// background tab.
+function notifyPanelOpened() {
+  if (document.visibilityState !== "visible") return;
+  fetch("/api/panel-opened", { method: "POST" }).catch(() => {});
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    notifyPanelOpened();
+    loadActionItems();
+  }
+});
+window.addEventListener("focus", notifyPanelOpened);
+notifyPanelOpened();
 loadActionItems();
-setInterval(loadActionItems, REFRESH_MS);
+setInterval(() => {
+  notifyPanelOpened();
+  loadActionItems();
+}, REFRESH_MS);
