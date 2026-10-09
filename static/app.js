@@ -1250,23 +1250,38 @@ function renderStaleRows() {
         tdCheck.appendChild(cb);
       }
 
+      // The description sits on its own line under the name, indented with
+      // it (the same layout as the Needs Remediation rows), so the Status
+      // cell is free for the button.
       const tdName = document.createElement("td");
       const indentClass = singleEndpoint ? "" : "row-name-indent";
-      tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+      let nameHtml = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+      if (item.secondary_info) nameHtml += `<div class="row-secondary ${indentClass}">${escapeHtml(item.secondary_info)}</div>`;
+      tdName.innerHTML = nameHtml;
 
+      // Delete removes the device from Home Assistant's device registry (the
+      // same call the action bar makes for ticked rows), after a
+      // confirmation. It replaced a "Review" link that opened the device
+      // page in a new browser window and asked for a login.
       const tdStatus = document.createElement("td");
-      tdStatus.innerHTML = `<span class="row-secondary">${escapeHtml(item.secondary_info || "")}</span>`;
-      const navPath = item?.navigation_path;
-      if (state.haBaseUrl && navPath) {
-        const link = document.createElement("a");
-        link.href = `${state.haBaseUrl}${navPath}`;
-        link.target = "_blank";
-        link.rel = "noopener";
-        link.className = "row-action-btn";
-        link.style.textDecoration = "none";
-        link.textContent = "Review";
-        wireExternalLink(link);
-        tdStatus.appendChild(link);
+      if (deviceId) {
+        const pendingKey = `delete-stale:${deviceId}`;
+        const pending = isPending(pendingKey);
+        const actions = document.createElement("div");
+        actions.className = "row-actions";
+        const del = document.createElement("button");
+        del.className = "row-action-btn";
+        del.textContent = pending ? "Deleting…" : "Delete";
+        del.disabled = pending || isPending("delete-stale-batch");
+        del.addEventListener("click", () =>
+          showConfirmDialog(
+            `Permanently delete ${item.name}${ep.host ? ` (${ep.host})` : ""}? This cannot be undone.`,
+            "Delete",
+            () => runPending(pendingKey, () => deleteStaleDevices([deviceId]))
+          )
+        );
+        actions.appendChild(del);
+        tdStatus.appendChild(actions);
       }
 
       tr.append(tdCheck, tdName, tdStatus);
@@ -1299,13 +1314,32 @@ const CLEANUP_ACTIONS = [
   { id: "volumes", label: "Prune unused volumes", short: "unused volumes", pendingKey: (d) => `cleanup-volumes:${d}` },
 ];
 
-// An endpoint with no images at all has nothing for either image prune to do,
-// so both are disabled (and can't be ticked or batch-run). `images_count` is
-// the endpoint's total image count (dangling ones included) from core's own
-// images-count sensor; a dashboard integration too old to send it, or an
-// unknown value, leaves the rows enabled. Volumes are not affected.
+// An endpoint with nothing for the image prunes to remove has both disabled
+// (and they can't be ticked or batch-run). That is when:
+//   - `images_count` (the endpoint's total image count, dangling ones
+//     included, from core's own images-count sensor) is 0, or
+//   - the unused-image count the row shows (`unused_estimate`: images minus
+//     containers) is 0 -- which is what a prune leaves behind, since the
+//     images the running containers use stay -- unless the byte-accurate
+//     `reclaimable_mib` says there is still something to reclaim (the estimate
+//     reads 0 when containers share an image even though one image is unused).
+// A dashboard integration too old to send these, or an unknown value, leaves
+// the rows enabled. Volumes are not affected: they are a separate prune.
+function imagePruneHasNothingToDo(ep) {
+  if (ep.images_count === 0) return true;
+  return ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0);
+}
+
 function cleanupActionDisabled(ep, actionId) {
-  return (actionId === "dangling" || actionId === "unused") && ep.images_count === 0;
+  return (actionId === "dangling" || actionId === "unused") && imagePruneHasNothingToDo(ep);
+}
+
+// Prune actions that can't run at the same time on one endpoint. The two image
+// prunes both remove images, so while one runs the other waits; the volume
+// prune is independent of them and of each other group.
+const CLEANUP_IMAGE_ACTIONS = ["dangling", "unused"];
+function cleanupActionGroup(actionId) {
+  return CLEANUP_IMAGE_ACTIONS.includes(actionId) ? CLEANUP_IMAGE_ACTIONS : [actionId];
 }
 
 // The tick ids a row, header or "select all" may set for this endpoint.
@@ -1421,14 +1455,13 @@ function renderCleanupRows() {
 
     const indent = !singleEndpoint;
     const noImages = ep.images_count === 0;
+    const nothingToPrune = imagePruneHasNothingToDo(ep);
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
     const unusedRowBadge = noImages ? "no images" : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
-    // All three actions on one endpoint go through the same Portainer
-    // connection and the same Cleanup refresh, so while any one is running the
-    // others are disabled too (their own buttons keep their normal text).
-    const endpointBusy = CLEANUP_ACTIONS.some((a) => isPending(a.pendingKey(ep.device_id)));
+    // A running prune disables only the actions it conflicts with (the other
+    // image prune), not the volume prune. See cleanupActionGroup.
 
     // Both image actions send dangling=<true|false> to
     // portainer_maintenance.prune_images, which core's portainer.prune_images
@@ -1437,7 +1470,7 @@ function renderCleanupRows() {
     const specs = {
       dangling: {
         note: "Removes only untagged images that no container uses, which includes the old image an update leaves behind. “Prune unused images” also removes tagged ones. Needs Home Assistant 2026.10 or later.",
-        badgeText: noImages ? "no images" : null,
+        badgeText: noImages ? "no images" : nothingToPrune ? "nothing to prune" : null,
         confirm: `Remove every dangling (untagged, unused) image on ${ep.host}? This cannot be undone.`,
         run: () => pruneImages(true, null, [ep.device_id]),
       },
@@ -1468,7 +1501,7 @@ function renderCleanupRows() {
           buttonText: "Prune",
           pendingText: "Pruning…",
           pending: isPending(pendingKey),
-          disabled: endpointBusy || unavailable,
+          disabled: unavailable || cleanupActionGroup(action.id).some((id) => isPending(CLEANUP_ACTIONS.find((a) => a.id === id).pendingKey(ep.device_id))),
           indent,
           checkbox: selId ? { checked: !unavailable && sel.has(selId), disabled: unavailable, onChange: (checked) => toggleSelection("cleanup", selId, checked) } : null,
           onClick: () => {
