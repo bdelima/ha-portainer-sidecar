@@ -761,28 +761,30 @@ function renderGroupHeaderRow({
 // rather than a fake "Standalone" grouping node.
 // ---------------------------------------------------------------------
 
-// The status text next to a row's Install button: "Update available" when
-// there's no install result, otherwise the outcome of the last attempt.
-function installResultStatus(result) {
-  const span = document.createElement("span");
-  span.className = "row-secondary";
+// The description line under a row's name: "Update available" when there's no
+// install result, otherwise the outcome of the last attempt. It sits under the
+// name, indented with it (the same layout as the Needs Remediation and Stale
+// Devices rows), so the Status cell is left to the buttons.
+function installResultStatus(result, indentClass) {
+  const line = document.createElement("div");
+  line.className = `row-secondary ${indentClass}`;
   if (!result) {
-    span.textContent = "Update available";
-    return span;
+    line.textContent = "Update available";
+    return line;
   }
   if (result.kind === "installed") {
-    span.textContent = result.needsStackRestart
+    line.textContent = result.needsStackRestart
       ? "Installed — stack needs a restart, see the Needs Remediation tab"
       : "Installed — confirming…";
-    return span;
+    return line;
   }
-  span.textContent = result.message;
-  span.title = result.detail || result.message;
-  span.style.fontWeight = "500";
+  line.textContent = result.message;
+  line.title = result.detail || result.message;
+  line.style.fontWeight = "500";
   // A confirmed failure is red; a timeout or lost job is "outcome unknown",
   // which is a warning, not a verdict.
-  span.style.color = result.kind === "failed" ? "var(--danger)" : "var(--warn)";
-  return span;
+  line.style.color = result.kind === "failed" ? "var(--danger)" : "var(--warn)";
+  return line;
 }
 
 function renderUpdateChildRow(item, indentLevel) {
@@ -802,6 +804,8 @@ function renderUpdateChildRow(item, indentLevel) {
   tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
 
   const tdStatus = document.createElement("td");
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
   const installKey = `install:${item.entity}`;
   const installPending = isPending(installKey);
   const installResult = installPending ? null : state.installResults.get(item.entity) || null;
@@ -822,8 +826,8 @@ function renderUpdateChildRow(item, indentLevel) {
     state.installResults.delete(item.entity);
     runPending(installKey, () => installUpdates([item.entity]));
   });
-  tdStatus.appendChild(installResultStatus(installResult));
-  tdStatus.appendChild(installBtn);
+  tdName.appendChild(installResultStatus(installResult, indentClass));
+  actions.appendChild(installBtn);
   if (item.changelog_repo) {
     // (1.3.8) Renders release notes in-app (see showChangelogDialog) --
     // a plain in-page button, not a link, since nothing here opens a new
@@ -835,7 +839,7 @@ function renderUpdateChildRow(item, indentLevel) {
     changelogBtn.className = "row-changelog-link row-changelog-btn";
     changelogBtn.textContent = "Changelog";
     changelogBtn.addEventListener("click", () => showChangelogDialog(item.changelog_repo));
-    tdStatus.appendChild(changelogBtn);
+    actions.appendChild(changelogBtn);
   } else if (item.changelog_url) {
     const changelogLink = document.createElement("a");
     changelogLink.className = "row-changelog-link";
@@ -844,8 +848,9 @@ function renderUpdateChildRow(item, indentLevel) {
     changelogLink.rel = "noopener";
     changelogLink.textContent = "Changelog";
     wireExternalLink(changelogLink);
-    tdStatus.appendChild(changelogLink);
+    actions.appendChild(changelogLink);
   }
+  tdStatus.appendChild(actions);
 
   tr.append(tdCheck, tdName, tdStatus);
   return tr;
