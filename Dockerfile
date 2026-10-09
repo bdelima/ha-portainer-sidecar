@@ -16,6 +16,7 @@ LABEL org.opencontainers.image.source="https://github.com/bdelima/ha-portainer-s
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
 ENV APP_VERSION="${VERSION}"
+ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8000
 

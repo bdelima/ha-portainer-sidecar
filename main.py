@@ -48,6 +48,10 @@ Environment variables:
                      is set. false: refuse to serve unless the pair is set.
                      Unset: open when no pair is set, sign-in required when
                      both are.
+    LOG_LEVEL       Optional. DEBUG, INFO (default), WARNING or ERROR: how much
+                     this app writes to its container log (see "Logging"
+                     below). Passwords, the HA token, session cookies and the
+                     panel token are never logged at any level.
 """
 from __future__ import annotations
 
@@ -56,9 +60,11 @@ import hashlib
 import hmac
 import html
 import ipaddress
+import logging
 import os
 import re
 import socket
+import sys
 import time
 import uuid
 from urllib.parse import parse_qs, urlencode
@@ -70,6 +76,94 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, field_validator
+
+# ---------------------------------------------------------------------------
+# Logging
+#
+# uvicorn only configures its own loggers (uvicorn, uvicorn.access,
+# uvicorn.error); anything logged under another name would be dropped below
+# WARNING. So this app owns a "sidecar" logger tree with its own stdout
+# handler and level (LOG_LEVEL):
+#
+#   sidecar         startup, Home Assistant reachability, changelog lookups
+#   sidecar.auth    sign-ins, failed sign-ins, rate limiting
+#   sidecar.action  every action a user triggers: what, on what, the result
+#                   and how long it took, with Home Assistant's own error text
+#                   when it refused
+#
+# uvicorn's access log is separate and only says "POST /api/... 502", never
+# why. These loggers are where the why goes.
+#
+# Never logged, at any level: passwords (submitted or configured), HA_TOKEN,
+# session cookies, the ?auth= panel token, or request query strings. Anything
+# a client supplies (entity ids, device ids, keys, headers) goes through _q(),
+# which repr()s and clips it so a newline in it can't forge a log line.
+# ---------------------------------------------------------------------------
+_LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+
+
+def _setup_logging() -> str | None:
+    """Configures the "sidecar" logger tree. Returns a message to log once the
+    handler exists if LOG_LEVEL was set to something unusable."""
+    raw = os.environ.get("LOG_LEVEL", "").strip()
+    level = getattr(logging, raw.upper(), None) if raw else logging.INFO
+    problem = None
+    if not isinstance(level, int):
+        problem = f"LOG_LEVEL={raw!r} is not a log level (use DEBUG, INFO, WARNING or ERROR); using INFO"
+        level = logging.INFO
+    root = logging.getLogger("sidecar")
+    root.setLevel(level)
+    if not root.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(logging.Formatter(_LOG_FORMAT, "%Y-%m-%d %H:%M:%S"))
+        root.addHandler(handler)
+    root.propagate = False
+    return problem
+
+
+_LOG_LEVEL_PROBLEM = _setup_logging()
+log = logging.getLogger("sidecar")
+log_auth = logging.getLogger("sidecar.auth")
+log_action = logging.getLogger("sidecar.action")
+
+
+def _q(value: Any, limit: int = 200) -> str:
+    """repr() of a client-supplied value, clipped, safe to put in a log line."""
+    text = str(value)
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return repr(text)
+
+
+def _peer(request: Request) -> str:
+    """Who is asking. The socket address is what uvicorn saw (behind a reverse
+    proxy that is the proxy). X-Forwarded-For is added when present but is
+    only a claim by whoever sent it, so it is labelled as one."""
+    ip = request.client.host if request.client else "unknown"
+    fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+    return f"{ip} (X-Forwarded-For {_q(fwd, 64)})" if fwd else ip
+
+
+def _reason(exc: Exception) -> str:
+    """Why a Home Assistant call failed, as one short string: the HTTP status
+    (or the exception type for a timeout or connection error, whose str() is
+    often empty) followed by HA's own message when it gave one."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    prefix = f"HTTP {status}" if status else type(exc).__name__
+    message = _ha_error_message(exc) if isinstance(exc, httpx.HTTPError) else str(exc)
+    message = " ".join(message.split())[:500]
+    return f"{prefix}: {message}" if message else prefix
+
+
+def _action_ok(action: str, detail: str, started: float, extra: str = "") -> None:
+    log_action.info("%s ok %s (%.1fs)%s", action, detail, time.monotonic() - started, extra)
+
+
+def _action_failed(action: str, detail: str, exc: Exception, started: float) -> None:
+    log_action.warning(
+        "%s FAILED %s: %s (%.1fs)", action, detail, _reason(exc), time.monotonic() - started
+    )
+
 
 def _load_token() -> str:
     """Prefer a mounted secret file (HA_TOKEN_FILE) over a plain env var
@@ -453,8 +547,17 @@ async def _auth_gate(request: Request, call_next):
         target = path + ("?" + urlencode(rest) if rest else "")
         response = RedirectResponse(target, status_code=303)
         _set_session_cookie(response, request)
+        log_auth.info("signed in with the panel token from %s", _peer(request))
         return response
+    if token:
+        # A panel token was presented and it was wrong (most often a stale
+        # link after the password changed). The token itself is not logged.
+        log_auth.warning("rejected a wrong panel token on %s %s from %s", request.method, _q(path), _peer(request))
     if path.startswith("/api/"):
+        # DEBUG, not WARNING: a browser tab left open after its session
+        # expired polls /api/action-items every 15 seconds, and uvicorn's
+        # access log already shows each 401.
+        log_auth.debug("unauthenticated %s %s from %s", request.method, _q(path), _peer(request))
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     target = path + ("?" + request.url.query if request.url.query else "")
     return RedirectResponse("/login?" + urlencode({"next": target}), status_code=303)
@@ -462,18 +565,25 @@ async def _auth_gate(request: Request, call_next):
 
 @app.on_event("startup")
 async def _log_auth_mode() -> None:
+    log.info(
+        "Portainer Sidecar %s starting (log level %s)",
+        APP_VERSION,
+        logging.getLevelName(log.getEffectiveLevel()),
+    )
+    if _LOG_LEVEL_PROBLEM:
+        log.warning(_LOG_LEVEL_PROBLEM)
     mode = _auth_mode()
     if mode == "anonymous" and AUTH_ALLOW_ANONYMOUS:
-        print("[startup] AUTH_ALLOW_ANONYMOUS is true: this app is serving WITHOUT authentication")
+        log_auth.warning("AUTH_ALLOW_ANONYMOUS is true: this app is serving WITHOUT authentication")
     elif mode == "anonymous":
-        print(
-            "[startup] No sign-in configured: this app is serving WITHOUT authentication. "
+        log_auth.warning(
+            "No sign-in configured: this app is serving WITHOUT authentication. "
             "Set AUTH_USERNAME and AUTH_PASSWORD to require one."
         )
     elif mode == "locked":
-        print(f"[startup] ERROR: {_locked_message()} Serving only /healthz and /version.")
+        log_auth.error("%s Serving only /healthz and /version.", _locked_message())
     else:
-        print(f"[startup] Authentication required (user {AUTH_USERNAME!r})")
+        log_auth.info("Authentication required (user %s)", _q(AUTH_USERNAME))
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -485,11 +595,18 @@ async def login_page(next: str = "/") -> HTMLResponse:
 async def login_submit(request: Request) -> Any:
     ip = request.client.host if request.client else "unknown"
     if len(_recent_failures(ip)) >= _LOGIN_MAX_FAILURES:
+        log_auth.warning(
+            "sign-in blocked: %d failed attempts from %s in the last %d s",
+            _LOGIN_MAX_FAILURES,
+            _peer(request),
+            int(_LOGIN_WINDOW),
+        )
         return HTMLResponse(_login_html("/", "Too many failed attempts. Try again in a few minutes."), status_code=429)
     body = b""
     async for chunk in request.stream():
         body += chunk
         if len(body) > 4096:
+            log_auth.warning("sign-in form from %s rejected: body over 4096 bytes", _peer(request))
             raise HTTPException(status_code=413, detail="Request too large")
     form = parse_qs(body.decode("utf-8", "replace"))
     username = form.get("username", [""])[0]
@@ -499,8 +616,18 @@ async def login_submit(request: Request) -> Any:
         _LOGIN_FAILURES.pop(ip, None)
         response = RedirectResponse(next_path, status_code=303)
         _set_session_cookie(response, request)
+        log_auth.info("signed in with username and password from %s", _peer(request))
         return response
     _record_failure(ip)
+    # The attempted username is deliberately not logged: people paste the
+    # password into the wrong box, and it would end up here.
+    log_auth.warning(
+        "failed sign-in from %s (%d of %d allowed in %d s)",
+        _peer(request),
+        len(_recent_failures(ip)),
+        _LOGIN_MAX_FAILURES,
+        int(_LOGIN_WINDOW),
+    )
     await asyncio.sleep(_LOGIN_FAIL_DELAY)
     return HTMLResponse(_login_html(next_path, "Wrong username or password."), status_code=401)
 
@@ -537,7 +664,9 @@ async def _ensure_ha_base_url() -> None:
     global HA_BASE_URL, HA_PUBLIC_URL
     if HA_BASE_URL is None:
         HA_BASE_URL = await _discover_ha_base_url()
-        print(f"[startup] HA_BASE_URL not set -- auto-discovered Home Assistant at {HA_BASE_URL}")
+        log.info("HA_BASE_URL not set -- auto-discovered Home Assistant at %s", HA_BASE_URL)
+    else:
+        log.info("Using Home Assistant at %s (HA_BASE_URL)", HA_BASE_URL)
     if HA_PUBLIC_URL is None and os.environ.get("HA_BASE_URL"):
         # Only reuse HA_BASE_URL for browser links if the user set it
         # explicitly -- an auto-discovered address (container name or
@@ -632,18 +761,35 @@ async def panel_opened() -> dict[str, bool]:
             {"notification_id": ACTION_ITEMS_NOTIFICATION_ID},
             timeout=10,
         )
-    except httpx.HTTPError:
-        pass
+    except httpx.HTTPError as exc:
+        # Best effort by design, and it runs on every page load, so DEBUG.
+        log_action.debug("panel-opened: could not dismiss the bell notification: %s", _reason(exc))
     return {"ok": True}
+
+
+# True once a sensor read has worked, False after one has failed, None before
+# the first. The dashboard polls every 15 seconds per open tab, so a Home
+# Assistant outage would otherwise write a line every poll: only the change
+# (reachable -> unreachable, and back) is logged.
+_ha_reachable: bool | None = None
 
 
 @app.get("/api/action-items")
 async def get_action_items() -> dict[str, Any]:
+    global _ha_reachable
     result: dict[str, Any] = {}
     for key, entity_id in SENSORS.items():
         try:
             state = await ha_get_state(entity_id)
         except httpx.HTTPError as exc:
+            if _ha_reachable is not False:
+                log.warning(
+                    "Home Assistant request for %s failed: %s "
+                    "(not logged again until a request works)",
+                    entity_id,
+                    _reason(exc),
+                )
+            _ha_reachable = False
             raise HTTPException(status_code=502, detail=f"HA request failed for {entity_id}: {exc}") from exc
         raw_state = state.get("state", "0")
         try:
@@ -652,6 +798,9 @@ async def get_action_items() -> dict[str, Any]:
             count = 0
         items = state.get("attributes", {}).get("items", [])
         result[key] = {"count": count, "items": items}
+    if _ha_reachable is False:
+        log.info("Home Assistant is reachable again")
+    _ha_reachable = True
     return result
 
 
@@ -734,6 +883,13 @@ async def _run_endpoint_queue(endpoint_key: str) -> None:
 async def _run_job(job: UpdateJob) -> None:
     job.status = "running"
     job.started_at = time.monotonic()
+    log_action.info(
+        "install started %s (job %s, waited %.1fs in the %s queue)",
+        _q(job.entity_id),
+        job.id[:8],
+        job.started_at - job.queued_at,
+        _q(job.endpoint_key, 64),
+    )
     try:
         response = await ha_call_service_with_response(
             "portainer_maintenance", "perform_update", {"update_entity": job.entity_id}
@@ -741,12 +897,25 @@ async def _run_job(job: UpdateJob) -> None:
         job.needs_stack_restart = bool(response.get("needs_stack_restart"))
         job.stack_switch_entity_id = response.get("stack_switch_entity_id")
         job.status = "succeeded"
+        _action_ok(
+            "install",
+            f"{_q(job.entity_id)} (job {job.id[:8]})",
+            job.started_at,
+            " -- the owning stack needs a restart to finish" if job.needs_stack_restart else "",
+        )
     except httpx.TimeoutException as exc:
         job.status = "timed_out"
         job.error = str(exc)
+        log_action.warning(
+            "install TIMED OUT %s (job %s): %s -- Home Assistant may still be working on it",
+            _q(job.entity_id),
+            job.id[:8],
+            _reason(exc),
+        )
     except httpx.HTTPError as exc:
         job.status = "failed"
         job.error = str(exc)
+        _action_failed("install", f"{_q(job.entity_id)} (job {job.id[:8]})", exc, job.started_at)
     except Exception as exc:
         # Anything else (an empty or non-JSON 200 from HA, a null/list
         # service_response, ...). Must be caught here: this runs inside the
@@ -756,6 +925,7 @@ async def _run_job(job: UpdateJob) -> None:
         # restarts. (CancelledError is a BaseException and still propagates.)
         job.status = "failed"
         job.error = f"{type(exc).__name__}: {exc}"
+        log_action.exception("install FAILED %s (job %s) unexpectedly", _q(job.entity_id), job.id[:8])
     finally:
         job.finished_at = time.monotonic()
 
@@ -794,6 +964,12 @@ async def install_updates(payload: InstallRequest) -> dict[str, Any]:
         JOBS[job.id] = job
         _get_endpoint_queue(item.endpoint_key).put_nowait(job.id)
         job_ids.append(job.id)
+    log_action.info(
+        "install requested for %d update(s): %s",
+        len(payload.updates),
+        ", ".join(_q(u.entity_id, 120) for u in payload.updates[:20])
+        + (f", and {len(payload.updates) - 20} more" if len(payload.updates) > 20 else ""),
+    )
     return {"job_ids": job_ids}
 
 
@@ -869,6 +1045,9 @@ async def restart_stack(payload: RestartStackRequest) -> dict[str, Any]:
     # was still correctly running to completion on the HA side -- the
     # stack came back up fine, but the webapp reported a failure it never
     # actually had.
+    started = time.monotonic()
+    detail = _q(payload.switch_entity_id)
+    log_action.info("restart_stack started %s (stops then starts every container in the stack)", detail)
     try:
         await ha_call_service(
             "portainer_maintenance",
@@ -876,7 +1055,9 @@ async def restart_stack(payload: RestartStackRequest) -> dict[str, Any]:
             {"switch_entity_id": payload.switch_entity_id},
             timeout=120,
         )
+        _action_ok("restart_stack", detail, started)
     except httpx.HTTPError as exc:
+        _action_failed("restart_stack", detail, exc, started)
         # (fix) Was `except httpx.HTTPStatusError` -- caught a bad HTTP
         # response from HA, but not a client-side timeout/connection
         # error (httpx.TimeoutException, httpx.ConnectError, etc, which
@@ -897,11 +1078,22 @@ class DeleteStaleRequest(BaseModel):
 @app.post("/api/actions/delete-stale")
 async def delete_stale_devices(payload: DeleteStaleRequest) -> dict[str, Any]:
     errors = []
+    # remove_device has no undo, so each deletion is logged by device id (the
+    # only name this app has for it) as it happens, not just in a summary.
     for device_id in payload.device_ids:
+        started = time.monotonic()
         try:
             await ha_call_service("portainer_maintenance", "remove_device", {"device_id": device_id})
+            _action_ok("delete_stale", f"device {_q(device_id)} removed", started)
         except httpx.HTTPError as exc:
+            _action_failed("delete_stale", f"device {_q(device_id)}", exc, started)
             errors.append({"device_id": device_id, "error": str(exc)})
+    log_action.info(
+        "delete_stale finished: %d requested, %d removed, %d failed",
+        len(payload.device_ids),
+        len(payload.device_ids) - len(errors),
+        len(errors),
+    )
     return {"attempted": len(payload.device_ids), "errors": errors}
 
 
@@ -924,9 +1116,16 @@ async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
         data["until_hours"] = payload.until_hours
     if payload.device_ids:
         data["device_ids"] = payload.device_ids
+    started = time.monotonic()
+    detail = (
+        f"dangling={payload.dangling} until_hours={payload.until_hours} on "
+        + (", ".join(_q(d, 64) for d in payload.device_ids) if payload.device_ids else "every endpoint")
+    )
     try:
         await ha_call_service("portainer_maintenance", "prune_images", data)
+        _action_ok("prune_images", detail, started)
     except httpx.HTTPError as exc:
+        _action_failed("prune_images", detail, exc, started)
         raise HTTPException(status_code=502, detail=f"prune_images failed: {exc}") from exc
     return {"ok": True}
 
@@ -944,9 +1143,15 @@ async def prune_volumes(payload: PruneVolumesRequest) -> dict[str, Any]:
     data: dict[str, Any] = {}
     if payload.device_ids:
         data["device_ids"] = payload.device_ids
+    started = time.monotonic()
+    detail = "on " + (
+        ", ".join(_q(d, 64) for d in payload.device_ids) if payload.device_ids else "every endpoint"
+    )
     try:
         await ha_call_service("portainer_maintenance", "prune_volumes", data)
+        _action_ok("prune_volumes", detail, started)
     except httpx.HTTPError as exc:
+        _action_failed("prune_volumes", detail, exc, started)
         raise HTTPException(status_code=502, detail=f"prune_volumes failed: {exc}") from exc
     return {"ok": True}
 
@@ -961,11 +1166,15 @@ async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
     given endpoint device -- the Trouble tab's remediation for an endpoint
     that's dropped its connection, the same reload Settings -> Devices &
     Services -> Portainer -> Reload performs from HA's own UI."""
+    started = time.monotonic()
+    detail = f"endpoint {_q(payload.device_id, 64)}"
     try:
         await ha_call_service(
             "portainer_maintenance", "reload_endpoint", {"device_id": payload.device_id}
         )
+        _action_ok("reload_endpoint", detail, started)
     except httpx.HTTPError as exc:
+        _action_failed("reload_endpoint", detail, exc, started)
         raise HTTPException(status_code=502, detail=f"reload_endpoint failed: {exc}") from exc
     return {"ok": True}
 
@@ -992,11 +1201,15 @@ async def dismiss_trouble_item(payload: DismissRequest) -> dict[str, Any]:
     Delegates to portainer_maintenance.dismiss_trouble_item (HA side),
     which owns how long a dismissal lasts. Needs an integration version
     that has that service; an older one answers 502 here."""
+    started = time.monotonic()
+    detail = _q(payload.dismiss_key)
     try:
         await ha_call_service(
             "portainer_maintenance", "dismiss_trouble_item", {"dismiss_key": payload.dismiss_key}
         )
+        _action_ok("dismiss", detail, started)
     except httpx.HTTPError as exc:
+        _action_failed("dismiss", detail, exc, started)
         raise HTTPException(status_code=502, detail=f"dismiss failed: {exc}") from exc
     return {"ok": True}
 
@@ -1045,6 +1258,9 @@ async def update_portainer(payload: UpdatePortainerRequest) -> dict[str, Any]:
     it has started -- the update itself then happens out of band and
     Portainer restarts partway through. Needs an integration version that
     has that service; an older one answers 502 here."""
+    started = time.monotonic()
+    detail = _q(payload.update_entity)
+    log_action.info("update_portainer started %s (Portainer restarts partway through)", detail)
     try:
         result = await ha_call_service_with_response(
             "portainer_maintenance",
@@ -1052,7 +1268,9 @@ async def update_portainer(payload: UpdatePortainerRequest) -> dict[str, Any]:
             {"update_entity": payload.update_entity},
             timeout=330,
         )
+        _action_ok("update_portainer", detail, started, f": {_q(result, 300)}")
     except httpx.HTTPError as exc:
+        _action_failed("update_portainer", detail, exc, started)
         raise HTTPException(
             status_code=502, detail=f"Portainer update failed: {_ha_error_message(exc)}"
         ) from exc
@@ -1128,7 +1346,10 @@ async def get_changelog(repo: str) -> dict[str, Any]:
     else:
         try:
             release = await _fetch_github_release(repo)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
+            # Cached as "none" for CHANGELOG_CACHE_TTL_SECONDS below, so this
+            # logs at most once per repo per TTL.
+            log.warning("changelog lookup for %s failed: %s", _q(repo, 100), _reason(exc))
             release = None
         _CHANGELOG_CACHE[repo] = (now, release)
 
