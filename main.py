@@ -97,7 +97,13 @@ from pydantic import BaseModel, field_validator
 # Never logged, at any level: passwords (submitted or configured), HA_TOKEN,
 # session cookies, the ?auth= panel token, or request query strings. Anything
 # a client supplies (entity ids, device ids, keys, headers) goes through _q(),
-# which repr()s and clips it so a newline in it can't forge a log line.
+# which repr()s it so a newline in it can't forge a log line. Nothing a user
+# action logs is clipped: the whole entity id list, the whole result Home
+# Assistant returned and the whole error text are written, because a clipped
+# line is useless for working out what a call actually did. The one exception
+# is what an unauthenticated caller controls (the request path and the
+# X-Forwarded-For header on the sidecar.auth lines, see _PRE_AUTH_CLIP), which
+# is clipped so a stranger can't fill the log.
 # ---------------------------------------------------------------------------
 _LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
@@ -127,10 +133,15 @@ log_auth = logging.getLogger("sidecar.auth")
 log_action = logging.getLogger("sidecar.action")
 
 
-def _q(value: Any, limit: int = 200) -> str:
-    """repr() of a client-supplied value, clipped, safe to put in a log line."""
+# Applied only to values an unauthenticated caller controls.
+_PRE_AUTH_CLIP = 2000
+
+
+def _q(value: Any, limit: int | None = None) -> str:
+    """repr() of a value, safe to put in a log line (a newline in it is
+    escaped, so it can't forge one). Not clipped unless a limit is given."""
     text = str(value)
-    if len(text) > limit:
+    if limit is not None and len(text) > limit:
         text = text[:limit] + "..."
     return repr(text)
 
@@ -141,7 +152,7 @@ def _peer(request: Request) -> str:
     only a claim by whoever sent it, so it is labelled as one."""
     ip = request.client.host if request.client else "unknown"
     fwd = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
-    return f"{ip} (X-Forwarded-For {_q(fwd, 64)})" if fwd else ip
+    return f"{ip} (X-Forwarded-For {_q(fwd, _PRE_AUTH_CLIP)})" if fwd else ip
 
 
 def _reason(exc: Exception) -> str:
@@ -150,8 +161,8 @@ def _reason(exc: Exception) -> str:
     often empty) followed by HA's own message when it gave one."""
     status = getattr(getattr(exc, "response", None), "status_code", None)
     prefix = f"HTTP {status}" if status else type(exc).__name__
-    message = _ha_error_message(exc) if isinstance(exc, httpx.HTTPError) else str(exc)
-    message = " ".join(message.split())[:500]
+    message = _ha_error_message(exc, None) if isinstance(exc, httpx.HTTPError) else str(exc)
+    message = " ".join(message.split())
     return f"{prefix}: {message}" if message else prefix
 
 
@@ -552,12 +563,12 @@ async def _auth_gate(request: Request, call_next):
     if token:
         # A panel token was presented and it was wrong (most often a stale
         # link after the password changed). The token itself is not logged.
-        log_auth.warning("rejected a wrong panel token on %s %s from %s", request.method, _q(path), _peer(request))
+        log_auth.warning("rejected a wrong panel token on %s %s from %s", request.method, _q(path, _PRE_AUTH_CLIP), _peer(request))
     if path.startswith("/api/"):
         # DEBUG, not WARNING: a browser tab left open after its session
         # expired polls /api/action-items every 15 seconds, and uvicorn's
         # access log already shows each 401.
-        log_auth.debug("unauthenticated %s %s from %s", request.method, _q(path), _peer(request))
+        log_auth.debug("unauthenticated %s %s from %s", request.method, _q(path, _PRE_AUTH_CLIP), _peer(request))
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     target = path + ("?" + request.url.query if request.url.query else "")
     return RedirectResponse("/login?" + urlencode({"next": target}), status_code=303)
@@ -888,7 +899,7 @@ async def _run_job(job: UpdateJob) -> None:
         _q(job.entity_id),
         job.id[:8],
         job.started_at - job.queued_at,
-        _q(job.endpoint_key, 64),
+        _q(job.endpoint_key),
     )
     try:
         response = await ha_call_service_with_response(
@@ -967,8 +978,7 @@ async def install_updates(payload: InstallRequest) -> dict[str, Any]:
     log_action.info(
         "install requested for %d update(s): %s",
         len(payload.updates),
-        ", ".join(_q(u.entity_id, 120) for u in payload.updates[:20])
-        + (f", and {len(payload.updates) - 20} more" if len(payload.updates) > 20 else ""),
+        ", ".join(_q(u.entity_id) for u in payload.updates),
     )
     return {"job_ids": job_ids}
 
@@ -1119,7 +1129,7 @@ async def prune_images(payload: PruneImagesRequest) -> dict[str, Any]:
     started = time.monotonic()
     detail = (
         f"dangling={payload.dangling} until_hours={payload.until_hours} on "
-        + (", ".join(_q(d, 64) for d in payload.device_ids) if payload.device_ids else "every endpoint")
+        + (", ".join(_q(d) for d in payload.device_ids) if payload.device_ids else "every endpoint")
     )
     try:
         await ha_call_service("portainer_maintenance", "prune_images", data)
@@ -1145,7 +1155,7 @@ async def prune_volumes(payload: PruneVolumesRequest) -> dict[str, Any]:
         data["device_ids"] = payload.device_ids
     started = time.monotonic()
     detail = "on " + (
-        ", ".join(_q(d, 64) for d in payload.device_ids) if payload.device_ids else "every endpoint"
+        ", ".join(_q(d) for d in payload.device_ids) if payload.device_ids else "every endpoint"
     )
     try:
         await ha_call_service("portainer_maintenance", "prune_volumes", data)
@@ -1167,7 +1177,7 @@ async def reload_endpoint(payload: ReloadEndpointRequest) -> dict[str, Any]:
     that's dropped its connection, the same reload Settings -> Devices &
     Services -> Portainer -> Reload performs from HA's own UI."""
     started = time.monotonic()
-    detail = f"endpoint {_q(payload.device_id, 64)}"
+    detail = f"endpoint {_q(payload.device_id)}"
     try:
         await ha_call_service(
             "portainer_maintenance", "reload_endpoint", {"device_id": payload.device_id}
@@ -1229,7 +1239,7 @@ class UpdatePortainerRequest(BaseModel):
         return value
 
 
-def _ha_error_message(exc: httpx.HTTPError) -> str:
+def _ha_error_message(exc: httpx.HTTPError, limit: int | None = 500) -> str:
     """HA's REST API puts the reason a service call failed in the response
     body: a ServiceValidationError is a 400 with the text as JSON or plain
     text, any other HomeAssistantError a 500 with {"message": ...}. Pull
@@ -1245,7 +1255,7 @@ def _ha_error_message(exc: httpx.HTTPError) -> str:
             pass
         text = (response.text or "").strip()
         if text:
-            return text[:500]
+            return text if limit is None else text[:limit]
     return str(exc)
 
 
@@ -1268,7 +1278,7 @@ async def update_portainer(payload: UpdatePortainerRequest) -> dict[str, Any]:
             {"update_entity": payload.update_entity},
             timeout=330,
         )
-        _action_ok("update_portainer", detail, started, f": {_q(result, 300)}")
+        _action_ok("update_portainer", detail, started, f": {_q(result)}")
     except httpx.HTTPError as exc:
         _action_failed("update_portainer", detail, exc, started)
         raise HTTPException(
@@ -1349,7 +1359,7 @@ async def get_changelog(repo: str) -> dict[str, Any]:
         except httpx.HTTPError as exc:
             # Cached as "none" for CHANGELOG_CACHE_TTL_SECONDS below, so this
             # logs at most once per repo per TTL.
-            log.warning("changelog lookup for %s failed: %s", _q(repo, 100), _reason(exc))
+            log.warning("changelog lookup for %s failed: %s", _q(repo), _reason(exc))
             release = None
         _CHANGELOG_CACHE[repo] = (now, release)
 
