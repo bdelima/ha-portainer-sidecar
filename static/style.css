@@ -210,6 +210,26 @@ h1 {
 .row-name { font-weight: 500; }
 .row-secondary { color: var(--muted); font-size: 0.8rem; margin-top: 2px; }
 
+/* Buttons in a Trouble row's Status cell: a spaced group instead of bare
+   floated buttons. row-reverse keeps the order the floats gave them (first
+   button rightmost) and right-aligns the group. No wrapping: the column
+   takes the width of the buttons and the description gives way instead. */
+.row-actions {
+  display: flex;
+  flex-direction: row-reverse;
+  justify-content: flex-start;
+  gap: 8px;
+}
+.row-actions .row-action-btn { white-space: nowrap; }
+/* Phone width: one tidy column of equal-width buttons (top to bottom in
+   reading order) rather than a ragged wrapped row. */
+@media (max-width: 480px) {
+  .row-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
 .row-action-btn {
   background: var(--accent);
   color: #fff;
