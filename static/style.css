@@ -213,6 +213,7 @@ h1 {
    buttons off the right edge. */
 .row-name { font-weight: 500; overflow-wrap: anywhere; }
 .row-secondary { color: var(--muted); font-size: 0.8rem; margin-top: 2px; overflow-wrap: anywhere; }
+.row-secondary-failed { color: var(--danger); font-weight: 500; }
 /* Phone width: a little less horizontal padding in the tables, so the name
    column and the buttons both fit inside the panel. */
 @media (max-width: 480px) {
@@ -247,6 +248,21 @@ h1 {
     flex-direction: column;
     align-items: stretch;
   }
+}
+
+/* Phone width, Updates tab: each update is two table rows (see
+   renderUpdateChildRow). The first holds the checkbox (spanning both) and the
+   name across the full width; the second holds the description and the
+   buttons. The name wraps at spaces, and only breaks inside a word when that
+   one word is wider than the line, so "immich_machine_learning (drakebay)"
+   splits before "(drakebay)" instead of mid-word. */
+@media (max-width: 480px) {
+  .update-row-title td { border-bottom: none; }
+  .update-row-title td:not(:first-child) { padding-bottom: 2px; }
+  .update-row-title .row-name { overflow-wrap: break-word; }
+  .update-row-detail td { padding-top: 0; vertical-align: top; }
+  .update-row-detail .row-secondary { margin-top: 0; }
+  .update-row-detail td:last-child { width: 1%; white-space: nowrap; }
 }
 
 .row-action-btn {
