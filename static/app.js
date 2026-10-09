@@ -1322,12 +1322,17 @@ const CLEANUP_ACTIONS = [
 //     containers) is 0 -- which is what a prune leaves behind, since the
 //     images the running containers use stay -- unless the byte-accurate
 //     `reclaimable_mib` says there is still something to reclaim (the estimate
-//     reads 0 when containers share an image even though one image is unused).
+//     reads 0 when containers share an image even though one image is unused),
+//     or `reclaimable_mib` is unknown, in which case the estimate alone is not
+//     trusted to disable anything.
 // A dashboard integration too old to send these, or an unknown value, leaves
 // the rows enabled. Volumes are not affected: they are a separate prune.
 function imagePruneHasNothingToDo(ep) {
   if (ep.images_count === 0) return true;
-  return ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0);
+  // The byte-accurate figure has to be known to overrule the estimate: an
+  // unknown (null/missing) reclaimable_mib is "can't tell", so the buttons stay.
+  const reclaimableKnown = typeof ep.reclaimable_mib === "number";
+  return ep.unused_estimate === 0 && reclaimableKnown && !(ep.reclaimable_mib > 0);
 }
 
 function cleanupActionDisabled(ep, actionId) {
