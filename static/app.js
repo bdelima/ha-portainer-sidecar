@@ -8,6 +8,14 @@
 
 const REFRESH_MS = 15000;
 
+// Phone width: the same breakpoint as the phone rules in style.css. The Updates
+// rows pick their layout from it (see renderUpdateChildRow); crossing it, for
+// example by rotating the phone, re-renders (see the listener near setupTabs).
+const PHONE_MQ =
+  typeof window.matchMedia === "function"
+    ? window.matchMedia("(max-width: 480px)")
+    : { matches: false, addEventListener() {} };
+
 const state = {
   activeTab: "updates",
   data: {
@@ -62,6 +70,11 @@ const state = {
   // falling back to "Install" until the next fetch. See
   // pruneInstallResults() for when an entry is dropped.
   installResults: new Map(),
+  // Cleanup: endpoints whose numbers disagree about whether there is anything
+  // for the image prunes to remove, keyed by the endpoint's device_id, with
+  // the dashboard refreshes (their `refreshed_at` stamps) that showed the
+  // disagreement. See imagePruneBlock / trackPruneConflicts.
+  pruneConflict: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -427,6 +440,7 @@ async function loadActionItems() {
     const res = await fetch("/api/action-items");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     state.data = await res.json();
+    trackPruneConflicts();
     pruneDismissedTrouble();
     pruneSelection();
     pruneStackRestartErrors();
@@ -802,6 +816,7 @@ function renderUpdateChildRow(item, indentLevel) {
   const tdName = document.createElement("td");
   const indentClass = indentLevel === 2 ? "row-name-indent-2" : indentLevel === 1 ? "row-name-indent" : "";
   tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+  let descLine = null;
 
   const tdStatus = document.createElement("td");
   const actions = document.createElement("div");
@@ -826,7 +841,7 @@ function renderUpdateChildRow(item, indentLevel) {
     state.installResults.delete(item.entity);
     runPending(installKey, () => installUpdates([item.entity]));
   });
-  tdName.appendChild(installResultStatus(installResult, indentClass));
+  descLine = installResultStatus(installResult, indentClass);
   actions.appendChild(installBtn);
   if (item.changelog_repo) {
     // (1.3.8) Renders release notes in-app (see showChangelogDialog) --
@@ -852,6 +867,28 @@ function renderUpdateChildRow(item, indentLevel) {
   }
   tdStatus.appendChild(actions);
 
+  if (PHONE_MQ.matches) {
+    // Phone: the name gets its own full-width line at the top, so a long name
+    // such as immich_machine_learning (drakebay) wraps at its space instead of
+    // being squeezed between the checkbox and the buttons. Two table rows: the
+    // title (checkbox on the left spanning both rows, name across the other two
+    // columns), then the description with the buttons beside it.
+    tr.classList.add("update-row-title");
+    tdCheck.rowSpan = 2;
+    tdName.colSpan = 2;
+    tr.append(tdCheck, tdName);
+    const trDetail = document.createElement("tr");
+    trDetail.className = "stack-child-row update-row-detail";
+    if (tr.classList.contains("selected")) trDetail.classList.add("selected");
+    const tdDesc = document.createElement("td");
+    tdDesc.appendChild(descLine);
+    trDetail.append(tdDesc, tdStatus);
+    const pair = document.createDocumentFragment();
+    pair.append(tr, trDetail);
+    return pair;
+  }
+
+  tdName.appendChild(descLine);
   tr.append(tdCheck, tdName, tdStatus);
   return tr;
 }
@@ -1020,7 +1057,13 @@ function renderTroubleChildRow(item, indentLevel) {
   // so the Status cell is free for the buttons (on a phone the two used to
   // fight over one narrow column).
   let nameHtml = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
-  if (item.secondary_info) nameHtml += `<div class="row-secondary ${indentClass}">${escapeHtml(item.secondary_info)}</div>`;
+  // A Portainer self-update the integration is tracking says where it is in
+  // `update_state` ("updating" or "failed"; absent from an older integration)
+  // and puts the matching text in `secondary_info`. A failed one is shown red.
+  const updateFailed = item.update_state === "failed";
+  if (item.secondary_info) {
+    nameHtml += `<div class="row-secondary ${indentClass}${updateFailed ? " row-secondary-failed" : ""}">${escapeHtml(item.secondary_info)}</div>`;
+  }
   tdName.innerHTML = nameHtml;
   const tdStatus = document.createElement("td");
   const actions = document.createElement("div");
@@ -1045,16 +1088,21 @@ function renderTroubleChildRow(item, indentLevel) {
   // send it, so those rows keep just More Info and the manual steps). It is
   // confirmed first because Portainer goes away while it updates, and the
   // Updates tab already runs everything else before it for the same reason.
-  if (item.update_now && item.entity) {
+  // While the integration is tracking a started update (`update_state` is
+  // "updating") the button stays as a disabled "Updating…" until the
+  // integration reports the outcome, however long that takes, instead of
+  // going back to "Update now" a second after the click.
+  const updateRunning = item.update_state === "updating";
+  if ((item.update_now || updateRunning) && item.entity) {
     const pendingKey = `portainer-update:${item.entity}`;
-    const pending = isPending(pendingKey);
+    const pending = isPending(pendingKey) || updateRunning;
     const upd = document.createElement("button");
     upd.className = "row-action-btn";
     upd.textContent = pending ? "Updating…" : "Update now";
     upd.disabled = pending;
     upd.addEventListener("click", () =>
       showConfirmDialog(
-        `Update ${item.name} now? Portainer will restart and be unavailable for a minute or two, and this page cannot show progress. Do any other updates first.`,
+        `Update ${item.name} now? Portainer will restart and be unavailable for a minute or two; the row shows how it is going. Do any other updates first.`,
         "Update now",
         () => runPending(pendingKey, () => updatePortainer(item.entity)),
       ),
@@ -1319,25 +1367,72 @@ const CLEANUP_ACTIONS = [
   { id: "volumes", label: "Prune unused volumes", short: "unused volumes", pendingKey: (d) => `cleanup-volumes:${d}` },
 ];
 
-// An endpoint with nothing for the image prunes to remove has both disabled
-// (and they can't be ticked or batch-run). That is when:
-//   - `images_count` (the endpoint's total image count, dangling ones
-//     included, from core's own images-count sensor) is 0, or
-//   - the unused-image count the row shows (`unused_estimate`: images minus
-//     containers) is 0 -- which is what a prune leaves behind, since the
-//     images the running containers use stay -- unless the byte-accurate
-//     `reclaimable_mib` says there is still something to reclaim (the estimate
-//     reads 0 when containers share an image even though one image is unused),
-//     or `reclaimable_mib` is unknown, in which case the estimate alone is not
-//     trusted to disable anything.
-// A dashboard integration too old to send these, or an unknown value, leaves
+// Whether the two image prunes are available for an endpoint. They are off
+// (and can't be ticked or batch-run) when `imagePruneBlock` says why:
+//   "no-images"   `images_count` (every image on the endpoint, dangling ones
+//                 included) is 0.
+//   "unavailable" `reclaimable_unavailable`: the integration found core's
+//                 reclaimable-space sensor but it is unavailable. The state is
+//                 not known, so no action is offered.
+//   "nothing"     the unused-image count the row shows (`unused_estimate`:
+//                 images minus containers) is 0, which is what a prune leaves
+//                 behind since the images running containers use stay, unless
+//                 the byte-accurate `reclaimable_mib` is above 0 (the estimate
+//                 reads 0 when containers share an image even though one image
+//                 is unused). The integration sends 0 for a reclaimable sensor
+//                 that is Unknown (core reports Unknown when nothing can be
+//                 reclaimed) and null when the sensor doesn't exist at all;
+//                 both count as 0 here.
+//   "settling"    the count says there are unused images but reclaimable says
+//                 0. That is most likely the two sensors being read at
+//                 different moments, so the prunes stay off until a second
+//                 dashboard refresh shows the same thing, then the count wins
+//                 and they turn on. (The page re-reads every 15 s but the
+//                 dashboard only refreshes its Cleanup numbers every few
+//                 minutes, so it counts refreshes by their `refreshed_at`
+//                 stamp, not page polls.)
+// A dashboard integration too old to send these, or an unknown count, leaves
 // the rows enabled. Volumes are not affected: they are a separate prune.
+function imagePruneConflict(ep) {
+  return (
+    ep.images_count !== 0 &&
+    !ep.reclaimable_unavailable &&
+    typeof ep.unused_estimate === "number" &&
+    ep.unused_estimate > 0 &&
+    !(ep.reclaimable_mib > 0) &&
+    !!ep.refreshed_at
+  );
+}
+
+function imagePruneBlock(ep) {
+  if (ep.images_count === 0) return "no-images";
+  if (ep.reclaimable_unavailable) return "unavailable";
+  if (ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0)) return "nothing";
+  if (imagePruneConflict(ep)) {
+    const rec = state.pruneConflict.get(ep.device_id || ep.host);
+    if (!rec || rec.refreshes.size < 2) return "settling";
+  }
+  return null;
+}
+
 function imagePruneHasNothingToDo(ep) {
-  if (ep.images_count === 0) return true;
-  // The byte-accurate figure has to be known to overrule the estimate: an
-  // unknown (null/missing) reclaimable_mib is "can't tell", so the buttons stay.
-  const reclaimableKnown = typeof ep.reclaimable_mib === "number";
-  return ep.unused_estimate === 0 && reclaimableKnown && !(ep.reclaimable_mib > 0);
+  return imagePruneBlock(ep) !== null;
+}
+
+// Called after each fetch, before anything renders from the new data.
+function trackPruneConflicts() {
+  const live = new Set();
+  for (const ep of state.data.cleanup.items || []) {
+    if (!imagePruneConflict(ep)) continue;
+    const key = ep.device_id || ep.host;
+    live.add(key);
+    const rec = state.pruneConflict.get(key);
+    if (rec) rec.refreshes.add(ep.refreshed_at);
+    else state.pruneConflict.set(key, { refreshes: new Set([ep.refreshed_at]) });
+  }
+  for (const key of [...state.pruneConflict.keys()]) {
+    if (!live.has(key)) state.pruneConflict.delete(key);
+  }
 }
 
 function cleanupActionDisabled(ep, actionId) {
@@ -1465,10 +1560,15 @@ function renderCleanupRows() {
 
     const indent = !singleEndpoint;
     const noImages = ep.images_count === 0;
-    const nothingToPrune = imagePruneHasNothingToDo(ep);
+    const pruneBlock = imagePruneBlock(ep);
+    const pruneBlockBadge = { "no-images": "no images", nothing: "nothing to prune", unavailable: "status unavailable", settling: "checking…" }[pruneBlock] || null;
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const unusedRowBadge = noImages ? "no images" : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+    const unusedRowBadge = noImages
+      ? "no images"
+      : pruneBlock === "unavailable" || pruneBlock === "settling"
+        ? pruneBlockBadge
+        : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     // A running prune disables only the actions it conflicts with (the other
     // image prune), not the volume prune. See cleanupActionGroup.
@@ -1480,7 +1580,7 @@ function renderCleanupRows() {
     const specs = {
       dangling: {
         note: "Removes only untagged images that no container uses, which includes the old image an update leaves behind. “Prune unused images” also removes tagged ones. Needs Home Assistant 2026.10 or later.",
-        badgeText: noImages ? "no images" : nothingToPrune ? "nothing to prune" : null,
+        badgeText: pruneBlockBadge,
         confirm: `Remove every dangling (untagged, unused) image on ${ep.host}? This cannot be undone.`,
         run: () => pruneImages(true, null, [ep.device_id]),
       },
@@ -1950,8 +2050,9 @@ async function updatePortainer(entityId) {
       }
       throw new Error(detail || `HTTP ${res.status}`);
     }
-    // The row stays until the integration stops listing it; this only means
-    // the helper container started, not that Portainer has finished.
+    // This only means the helper container started, not that Portainer has
+    // finished: the row follows the update from here (an integration that
+    // tracks it reports "updating", then the row goes or comes back failed).
     showToast("Updater started — Portainer will restart");
   } catch (e) {
     showToast(`Portainer update failed — ${e.message}`);
@@ -2204,6 +2305,7 @@ el("refresh-btn").addEventListener("click", loadActionItems);
 
 setupTabs();
 setupSelectAll();
+PHONE_MQ.addEventListener("change", () => render());
 
 const initialTab = tabFromHash();
 if (initialTab) activateTab(initialTab);
