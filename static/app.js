@@ -1402,6 +1402,13 @@ const CLEANUP_ACTIONS = [
 
 // Whether the two image prunes are available for an endpoint. They are off
 // (and can't be ticked or batch-run) when `imagePruneBlock` says why:
+//   "computing"   the dashboard says this host's numbers are not ready yet
+//                 (`status: "computing"`: right after a restart its image
+//                 count, container count or reclaimable space has no usable
+//                 state yet). The numbers on the item are about to change.
+//   "unavailable" `status: "unavailable"`: the host was still not ready when
+//                 the dashboard's 5-minute backstop re-read ran. (Also, below,
+//                 `reclaimable_unavailable`.)
 //   "no-images"   `images_count` (every image on the endpoint, dangling ones
 //                 included) is 0.
 //   "unavailable" `reclaimable_unavailable`: the integration found core's
@@ -1424,8 +1431,18 @@ const CLEANUP_ACTIONS = [
 //                 dashboard only refreshes its Cleanup numbers every few
 //                 minutes, so it counts refreshes by their `refreshed_at`
 //                 stamp, not page polls.)
-// A dashboard integration too old to send these, or an unknown count, leaves
-// the rows enabled. Volumes are not affected: they are a separate prune.
+// A dashboard integration too old to send these (including `status`), or an
+// unknown count, leaves the rows enabled. Volumes are not affected: they are a
+// separate prune.
+//
+// `status` is the dashboard's own per-host verdict and wins over the rest: a
+// host that is computing or unavailable shows no numbers-based reason at all.
+// The "checking…" settling below is separate and sidecar-only: it covers two
+// numbers of a *ready* host that disagree.
+function hostNotReady(ep) {
+  return ep.status === "computing" || ep.status === "unavailable";
+}
+
 function imagePruneConflict(ep) {
   return (
     ep.images_count !== 0 &&
@@ -1438,6 +1455,8 @@ function imagePruneConflict(ep) {
 }
 
 function imagePruneBlock(ep) {
+  if (ep.status === "computing") return "computing";
+  if (ep.status === "unavailable") return "unavailable";
   if (ep.images_count === 0) return "no-images";
   if (ep.reclaimable_unavailable) return "unavailable";
   if (ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0)) return "nothing";
@@ -1456,7 +1475,7 @@ function imagePruneHasNothingToDo(ep) {
 function trackPruneConflicts() {
   const live = new Set();
   for (const ep of state.data.cleanup.items || []) {
-    if (!imagePruneConflict(ep)) continue;
+    if (hostNotReady(ep) || !imagePruneConflict(ep)) continue;
     const key = ep.device_id || ep.host;
     live.add(key);
     const rec = state.pruneConflict.get(key);
@@ -1568,7 +1587,8 @@ function renderCleanupRows() {
           // the "unused images" row's badge shows (not the number of
           // action rows, which is always the same). null (unknown upstream)
           // falls back to 0 rather than leaving the header blank.
-          count: ep.unused_estimate ?? 0,
+          // A host that is not ready counts 0, like the sensor does.
+          count: hostNotReady(ep) ? 0 : ep.unused_estimate ?? 0,
           indent: false,
           showCheckbox: true,
           checked: allTicked,
@@ -1594,14 +1614,16 @@ function renderCleanupRows() {
     const indent = !singleEndpoint;
     const noImages = ep.images_count === 0;
     const pruneBlock = imagePruneBlock(ep);
-    const pruneBlockBadge = { "no-images": "no images", nothing: "nothing to prune", unavailable: "status unavailable", settling: "checking…" }[pruneBlock] || null;
+    const pruneBlockBadge = { computing: "computing…", "no-images": "no images", nothing: "nothing to prune", unavailable: "status unavailable", settling: "checking…" }[pruneBlock] || null;
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const unusedRowBadge = noImages
-      ? "no images"
-      : pruneBlock === "unavailable" || pruneBlock === "settling"
-        ? pruneBlockBadge
-        : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+    const unusedRowBadge = hostNotReady(ep)
+      ? pruneBlockBadge
+      : noImages
+        ? "no images"
+        : pruneBlock === "unavailable" || pruneBlock === "settling"
+          ? pruneBlockBadge
+          : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     // A running prune disables only the actions it conflicts with (the other
     // image prune), not the volume prune. See cleanupActionGroup.
