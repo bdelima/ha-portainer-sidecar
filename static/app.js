@@ -188,7 +188,7 @@ function wireExternalLink(anchor) {
 // falling back to the link-dialog): the top one showing, and the other
 // sitting hidden-in-plain-sight underneath until the first was dismissed.
 // Closing every OTHER dialog before showing a new one keeps this a strict
-// one-at-a-time UI regardless of which combination of clicks a given
+// one-at-a-time UI regardless of which combination of dialogs a given
 // sequence of clicks happens to trigger.
 const DIALOG_IDS = ["confirm-dialog", "info-dialog", "link-dialog", "changelog-dialog"];
 function hideAllDialogs() {
@@ -672,8 +672,8 @@ function emptyRow(colspan, text) {
 // household" conflates two different questions: "does this household
 // only have one endpoint" (a real reason to collapse the level, since
 // naming a host that's always the only option is just noise) vs "does
-// only one endpoint currently have something wrong" (the endpoint's
-// name is exactly the context that matters there, especially with 3 real
+// only one endpoint currently have something wrong" (the endpoint's name
+// is exactly the context that matters there, especially with 3 real
 // endpoints and only one of them in trouble at the moment). Answering the
 // second question with the first one's logic is what hid which host was
 // affected the moment only one endpoint had anything to show on Trouble.
