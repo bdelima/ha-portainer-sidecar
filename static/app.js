@@ -50,6 +50,12 @@ const state = {
   // this set instead means every render(), however triggered, reflects
   // reality.
   pendingActions: new Set(),
+  // The "Update dashboard" row's Restart Home Assistant button: until this time
+  // (ms since the epoch) the restart counts as under way and the row says so.
+  // haSeenDown notes that a refresh failed since (Home Assistant went down), so
+  // the next one that works means it is back. See restartHomeAssistant.
+  haRestartingUntil: 0,
+  haSeenDown: false,
   // dismiss_key -> time it was clicked, for Trouble rows hidden optimistically
   // (see dismissTroubleItem / troubleView).
   dismissedTrouble: new Map(),
@@ -445,6 +451,11 @@ async function loadActionItems() {
     const res = await fetch("/api/action-items");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     state.data = await res.json();
+    if (state.haSeenDown || !(state.data.trouble.items || []).some((i) => i.kind === "dashboard_update")) {
+      // Home Assistant is back (or the row is gone): the restart is over.
+      state.haRestartingUntil = 0;
+      state.haSeenDown = false;
+    }
     trackPruneConflicts();
     pruneDismissedTrouble();
     pruneDeletedStale();
@@ -455,6 +466,7 @@ async function loadActionItems() {
     el("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
   } catch (e) {
     el("last-updated").textContent = "Refresh failed — will retry";
+    if (state.haRestartingUntil > Date.now()) state.haSeenDown = true;
     console.error(e);
   }
 }
@@ -1157,6 +1169,114 @@ function renderTroubleChildRow(item, indentLevel) {
   return tr;
 }
 
+// The sidecar's own "the dashboard integration is too old for me" row (see
+// dashboard_compat in main.py). `item.action` says which button it gets:
+// "update" downloads the newer integration through HACS, "restart" restarts
+// Home Assistant (after a confirmation: everything in it is down for a minute
+// or two). With neither, the row only explains.
+function renderDashboardUpdateRow(item) {
+  const tr = document.createElement("tr");
+  const tdName = document.createElement("td");
+  const restarting = state.haRestartingUntil > Date.now();
+  const secondary = restarting
+    ? "Home Assistant is restarting. This row goes away once it is back on the new version."
+    : item.secondary_info;
+  let nameHtml = `<div class="row-name">${escapeHtml(item.name)}</div>`;
+  if (secondary) nameHtml += `<div class="row-secondary">${escapeHtml(secondary)}</div>`;
+  tdName.innerHTML = nameHtml;
+  const tdStatus = document.createElement("td");
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+
+  if (item.detail) {
+    const info = document.createElement("button");
+    info.className = "row-action-btn";
+    info.textContent = "More Info";
+    info.addEventListener("click", () => showInfoDialog(item.name, item.detail));
+    actions.appendChild(info);
+  }
+
+  const button = (text, disabled, onClick) => {
+    const b = document.createElement("button");
+    b.className = "row-action-btn";
+    b.textContent = text;
+    b.disabled = disabled;
+    if (onClick) b.addEventListener("click", onClick);
+    actions.appendChild(b);
+  };
+  if (restarting) {
+    button("Restarting…", true);
+  } else if (item.action === "update") {
+    const pending = isPending("dashboard-update");
+    button(pending ? "Updating…" : "Update dashboard", pending, () =>
+      runPending("dashboard-update", updateDashboard),
+    );
+  } else if (item.action === "restart") {
+    const pending = isPending("restart-ha");
+    button(pending ? "Restarting…" : "Restart HA", pending, () =>
+      showConfirmDialog(
+        "Restart Home Assistant now? Everything in it, automations and notifications included, is unavailable for a minute or two, and this page cannot refresh until it is back.",
+        "Restart",
+        () => runPending("restart-ha", restartHomeAssistant),
+      ),
+    );
+  } else if (item.phase === "installing") {
+    button("Updating…", true);
+  }
+  if (actions.childElementCount > 0) tdStatus.appendChild(actions);
+
+  tr.append(tdName, tdStatus);
+  return tr;
+}
+
+async function updateDashboard() {
+  showToast("Downloading the dashboard integration through HACS…");
+  try {
+    const res = await fetch("/api/actions/update-dashboard", { method: "POST" });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch {
+        // Response wasn't JSON -- fall through with just the status.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    showToast("Downloaded — restart Home Assistant to finish");
+  } catch (e) {
+    showToast(`Update failed — ${e.message}`);
+    console.error(e);
+  }
+  await loadActionItems();
+}
+
+// How long the row keeps saying "restarting" if Home Assistant never shows
+// itself going down and coming back (normally it clears on that).
+const HA_RESTART_HOLD_MS = 180000;
+
+async function restartHomeAssistant() {
+  showToast("Restarting Home Assistant…");
+  try {
+    const res = await fetch("/api/actions/restart-ha", { method: "POST" });
+    if (!res.ok) {
+      let detail = "";
+      try {
+        detail = (await res.json()).detail || "";
+      } catch {
+        // Response wasn't JSON -- fall through with just the status.
+      }
+      throw new Error(detail || `HTTP ${res.status}`);
+    }
+    state.haRestartingUntil = Date.now() + HA_RESTART_HOLD_MS;
+    state.haSeenDown = false;
+    showToast("Home Assistant restart requested");
+  } catch (e) {
+    showToast(`Restart failed — ${e.message}`);
+    console.error(e);
+  }
+  await loadActionItems();
+}
+
 function renderTroubleRows() {
   const tbody = el("rows-trouble");
   tbody.innerHTML = "";
@@ -1166,8 +1286,14 @@ function renderTroubleRows() {
     return;
   }
 
-  const endpointItems = items.filter((i) => i.kind === "endpoint");
-  const otherItems = items.filter((i) => i.kind !== "endpoint");
+  // The "Update dashboard" row belongs to no endpoint: it goes first, above
+  // the endpoint tree.
+  for (const item of items.filter((i) => i.kind === "dashboard_update")) {
+    tbody.appendChild(renderDashboardUpdateRow(item));
+  }
+  const treeItems = items.filter((i) => i.kind !== "dashboard_update");
+  const endpointItems = treeItems.filter((i) => i.kind === "endpoint");
+  const otherItems = treeItems.filter((i) => i.kind !== "endpoint");
   const endpointGroups = groupByEndpoint(otherItems);
   // An endpoint that's itself the trouble might have no OTHER items under
   // it at all -- still needs its own row, so it isn't just silently
