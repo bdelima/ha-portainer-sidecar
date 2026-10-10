@@ -60,6 +60,7 @@ import hashlib
 import hmac
 import html
 import ipaddress
+import json
 import logging
 import os
 import re
@@ -862,16 +863,173 @@ async def _find_dashboard_update_entity() -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------
+# Getting the dashboard update on demand
+#
+# HACS looks for new releases on its own schedule, which it does not document
+# and which can be hours, and it has no service to ask it to look sooner. So
+# when the row is needed but HACS says there is nothing newer, two steps run,
+# in this order, each failing soft (a failure is logged and the next step, or
+# the row as it was, carries on):
+#   1. Ask HACS to re-check just the dashboard repository: the websocket
+#      command its own "Update information" menu item sends
+#      (hacs/repository/refresh). It is HACS's frontend command, not a
+#      documented API, and it needs an administrator's token. HACS identifies a
+#      repository by an internal id, found once through hacs/repositories/list.
+#   2. If HACS still shows nothing newer, look at the dashboard's newest GitHub
+#      release. A newer one than HACS has downloaded is offered anyway, and
+#      installed through update.install with an explicit version, which the
+#      HACS update entity supports. That path does not depend on HACS's own
+#      release data at all.
+# Step 1 is throttled (HACS_REFRESH_COOLDOWN_SECONDS) so the page's 15-second
+# polls do not turn into a GitHub request storm; step 2 is cached.
+# ---------------------------------------------------------------------
+HACS_REFRESH_COOLDOWN_SECONDS = 600
+DASHBOARD_RELEASE_TTL_SECONDS = 300
+_hacs_repo_id: str | None = None
+_hacs_refresh_at: float | None = None
+_hacs_refresh_lock = asyncio.Lock()
+_dashboard_release: tuple[float, str | None] | None = None
+_last_dashboard_decision: tuple[str, str] | None = None
+
+
+async def _ha_ws_session(work: Any, timeout: float = 20) -> Any:
+    """Opens Home Assistant's websocket API, signs in with the token and runs
+    `await work(call)`, where `await call(command)` sends one command and
+    returns its "result" message. Raises on any failure (the caller decides what
+    that means); the whole session is capped at `timeout` seconds."""
+    # Installed with uvicorn[standard]; imported here so that a missing or
+    # incompatible one only costs this feature, never the app starting.
+    from websockets.asyncio.client import connect
+
+    url = f"{str(HA_BASE_URL).replace('http', 'ws', 1)}/api/websocket"
+
+    async def run() -> Any:
+        async with connect(url, max_size=32 * 1024 * 1024, open_timeout=10) as ws:
+            greeting = json.loads(await ws.recv())
+            if greeting.get("type") != "auth_required":
+                raise RuntimeError(f"unexpected greeting from Home Assistant's websocket: {greeting.get('type')!r}")
+            await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+            reply = json.loads(await ws.recv())
+            if reply.get("type") != "auth_ok":
+                raise RuntimeError("Home Assistant's websocket did not accept the token")
+            next_id = 0
+
+            async def call(command: dict[str, Any]) -> dict[str, Any]:
+                nonlocal next_id
+                next_id += 1
+                await ws.send(json.dumps({**command, "id": next_id}))
+                while True:
+                    message = json.loads(await ws.recv())
+                    if message.get("type") == "result" and message.get("id") == next_id:
+                        return message
+
+            return await work(call)
+
+    return await asyncio.wait_for(run(), timeout)
+
+
+def _ws_error(message: dict[str, Any]) -> str:
+    error = message.get("error") or {}
+    return f"{error.get('code', 'error')}: {error.get('message', 'no message')}"
+
+
+async def _refresh_hacs_dashboard_repo() -> bool:
+    """Step 1: asks HACS to re-check the dashboard repository (and only that
+    one). True when HACS did it; False when it was skipped (asked within the
+    last HACS_REFRESH_COOLDOWN_SECONDS, whether or not that worked) or failed."""
+    global _hacs_repo_id, _hacs_refresh_at
+    async with _hacs_refresh_lock:
+        now = time.monotonic()
+        if _hacs_refresh_at is not None and now - _hacs_refresh_at < HACS_REFRESH_COOLDOWN_SECONDS:
+            return False
+        _hacs_refresh_at = now
+
+        async def work(call: Any) -> str:
+            global _hacs_repo_id
+            if _hacs_repo_id is None:
+                listed = await call({"type": "hacs/repositories/list", "categories": ["integration"]})
+                if not listed.get("success"):
+                    raise RuntimeError(f"HACS would not list its repositories ({_ws_error(listed)})")
+                for repo in listed.get("result") or []:
+                    if str(repo.get("full_name", "")).lower() == DASHBOARD_REPO.lower():
+                        _hacs_repo_id = str(repo.get("id"))
+                        break
+                if _hacs_repo_id is None:
+                    raise RuntimeError(f"HACS does not list {DASHBOARD_REPO}")
+            refreshed = await call({"type": "hacs/repository/refresh", "repository": _hacs_repo_id})
+            if not refreshed.get("success"):
+                _hacs_repo_id = None  # may be stale; looked up again next time
+                raise RuntimeError(f"HACS refused the re-check ({_ws_error(refreshed)})")
+            return _hacs_repo_id
+
+        started = time.monotonic()
+        try:
+            repo_id = await _ha_ws_session(work)
+        except Exception as exc:  # noqa: BLE001 -- this must never break the page, whatever goes wrong
+            log_action.warning(
+                "dashboard: asking HACS to re-check %s failed: %s (%.1fs); falling back to the GitHub release",
+                DASHBOARD_REPO, _reason(exc), time.monotonic() - started,
+            )
+            return False
+        log_action.info(
+            "dashboard: asked HACS to re-check %s (repository id %s) (%.1fs)",
+            DASHBOARD_REPO, _q(repo_id), time.monotonic() - started,
+        )
+        return True
+
+
+async def _latest_dashboard_release_tag() -> str | None:
+    """Step 2's lookup: the tag of the dashboard's newest GitHub release (not a
+    pre-release, and only if it is a plain major.minor.patch tag), or None.
+    Cached for DASHBOARD_RELEASE_TTL_SECONDS, failures included."""
+    global _dashboard_release
+    now = time.monotonic()
+    if _dashboard_release is not None and now - _dashboard_release[0] < DASHBOARD_RELEASE_TTL_SECONDS:
+        return _dashboard_release[1]
+    tag: str | None = None
+    try:
+        release = await _fetch_github_release(DASHBOARD_REPO)
+        if release and not release.get("prerelease") and _parse_level(release.get("tag_name")) is not None:
+            tag = str(release["tag_name"])
+    except httpx.HTTPError as exc:
+        log.warning("Latest %s release lookup failed: %s", DASHBOARD_REPO, _reason(exc))
+    _dashboard_release = (now, tag)
+    return tag
+
+
+def _log_dashboard_decision(via: str, version: str) -> None:
+    """Says once per change which route found the update, so the log shows
+    which of the two steps worked."""
+    global _last_dashboard_decision
+    if _last_dashboard_decision == (via, version):
+        return
+    _last_dashboard_decision = (via, version)
+    if via == "github":
+        log_action.info(
+            "dashboard: %s is released on GitHub but HACS still shows nothing newer; "
+            "it will be installed by explicit version", _q(version),
+        )
+    else:
+        log_action.info("dashboard: HACS offers %s", _q(version))
+
+
 def _dashboard_row(phase: str, running_level: str | None, running_version: str | None, installed: str,
-                   latest: str, entity: str | None) -> dict[str, Any]:
+                   latest: str, entity: str | None, via: str = "hacs",
+                   install_version: str | None = None) -> dict[str, Any]:
     """The Needs Remediation row for an integration that is too old. `phase`
     says where things stand and `action` which button (if any) the row gets:
-    "update" (download it through HACS) or "restart" (Home Assistant restart)."""
+    "update" (download it through HACS) or "restart" (Home Assistant restart).
+    `via` is "github" when the update was found on GitHub rather than offered
+    by HACS; `install_version` is then the release tag update.install is given."""
     required = REQUIRED_DASHBOARD_API_LEVEL
     reports = f"API level {running_level}" if running_level else "no API level (an older release)"
     need = f"This sidecar needs the Portainer Maintenance integration at API level {required} or later; the one running in Home Assistant reports {reports}."
     if phase == "update_available":
-        secondary = f"Version {latest} is available in HACS. Update it, then restart Home Assistant."
+        if via == "github":
+            secondary = f"Version {latest} is released on GitHub (HACS has not picked it up yet). Update it, then restart Home Assistant."
+        else:
+            secondary = f"Version {latest} is available in HACS. Update it, then restart Home Assistant."
         action = "update"
     elif phase == "installing":
         secondary = "Downloading the new version through HACS…"
@@ -905,6 +1063,8 @@ def _dashboard_row(phase: str, running_level: str | None, running_version: str |
         "phase": phase,
         "action": action,
         "update_entity": entity,
+        "via": via,
+        "install_version": install_version,
         "required_api_level": required,
         "running_api_level": running_level,
         "running_version": running_version,
@@ -936,10 +1096,28 @@ async def dashboard_compat() -> dict[str, Any] | None:
     hattrs = hacs.get("attributes") or {}
     installed = _norm_version(hattrs.get("installed_version"))
     latest = _norm_version(hattrs.get("latest_version"))
+    via = "hacs"
+    install_version: str | None = None
+    if not hattrs.get("in_progress") and str(hacs.get("state")) != "on":
+        # HACS shows nothing newer, which may only mean it has not looked yet.
+        # Step 1: ask it to re-check our repository, then read its answer again.
+        if await _refresh_hacs_dashboard_repo():
+            hacs = await _ha_state_or_none(entity) or hacs
+            hattrs = hacs.get("attributes") or {}
+            installed = _norm_version(hattrs.get("installed_version"))
+            latest = _norm_version(hattrs.get("latest_version"))
+        # Step 2: still nothing? Compare with the newest GitHub release.
+        if str(hacs.get("state")) != "on":
+            tag = await _latest_dashboard_release_tag()
+            current = _parse_level(installed) or _parse_level(running_version)
+            newest = _parse_level(tag)
+            if tag and newest and current and newest > current:
+                via, install_version, latest = "github", tag, _norm_version(tag)
     if hattrs.get("in_progress"):
         phase = "installing"
-    elif str(hacs.get("state")) == "on":
+    elif str(hacs.get("state")) == "on" or via == "github":
         phase = "update_available"
+        _log_dashboard_decision(via, latest)
     elif running_version:
         # The integration reports its running release: downloaded but not yet
         # running is exactly "HACS has a different version than Home
@@ -950,7 +1128,7 @@ async def dashboard_compat() -> dict[str, Any] | None:
         # pending" cannot be told apart from "no newer release", so offer the
         # restart with text that covers both.
         phase = "restart_or_unpublished"
-    return _dashboard_row(phase, running_level, running_version, installed, latest, entity)
+    return _dashboard_row(phase, running_level, running_version, installed, latest, entity, via, install_version)
 
 
 @app.post("/api/actions/update-dashboard")
@@ -964,9 +1142,16 @@ async def update_dashboard() -> dict[str, Any]:
         raise HTTPException(status_code=409, detail="The dashboard integration does not need downloading right now")
     entity = row["update_entity"]
     detail = _q(entity)
+    data: dict[str, Any] = {"entity_id": entity}
+    how = ""
+    if row.get("install_version"):
+        # Found on GitHub, not offered by HACS: name the version so HACS
+        # downloads it without needing to have noticed it.
+        data["version"] = row["install_version"]
+        how = " (explicit version, from the GitHub release)"
     try:
-        await ha_call_service("update", "install", {"entity_id": entity}, timeout=180)
-        _action_ok("update_dashboard", detail, started, f": {_q(row['latest_version'])}")
+        await ha_call_service("update", "install", data, timeout=180)
+        _action_ok("update_dashboard", detail, started, f": {_q(row['latest_version'])}{how}")
     except httpx.HTTPError as exc:
         _action_failed("update_dashboard", detail, exc, started)
         raise HTTPException(status_code=502, detail=f"update failed: {_ha_error_message(exc)}") from exc
