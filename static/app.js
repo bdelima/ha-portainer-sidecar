@@ -75,6 +75,11 @@ const state = {
   // the dashboard refreshes (their `refreshed_at` stamps) that showed the
   // disagreement. See imagePruneBlock / trackPruneConflicts.
   pruneConflict: new Map(),
+  // Stale Devices: device_id -> time it was deleted here, for devices whose
+  // delete succeeded but which the server may still list for a moment. They
+  // stay hidden until the server stops listing them. See deleteStaleDevices /
+  // staleView.
+  deletedStale: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -442,6 +447,7 @@ async function loadActionItems() {
     state.data = await res.json();
     trackPruneConflicts();
     pruneDismissedTrouble();
+    pruneDeletedStale();
     pruneSelection();
     pruneStackRestartErrors();
     pruneInstallResults();
@@ -560,11 +566,38 @@ function troubleView() {
   return { count: Math.max(0, raw.count - (items.length - kept.length)), items: kept };
 }
 
+// How long a deleted Stale device stays hidden while the server still lists it.
+// Normally the next refresh stops listing it (the integration re-scans when a
+// device is removed); this cap only matters if it never does, so the row comes
+// back rather than staying hidden against what the server says.
+const DELETED_HOLD_MS = 120000;
+
+// Forget deleted devices the server has stopped listing, or has listed for
+// longer than DELETED_HOLD_MS. Run on fresh data, before it is displayed.
+function pruneDeletedStale() {
+  const listed = new Set((state.data.stale.items || []).map((i) => staleDeviceId(i)).filter(Boolean));
+  const now = Date.now();
+  for (const [id, at] of [...state.deletedStale]) {
+    if (!listed.has(id) || now - at > DELETED_HOLD_MS) state.deletedStale.delete(id);
+  }
+}
+
+// The Stale data as displayed: the server's list minus devices deleted here and
+// not yet confirmed gone, with the count adjusted to match.
+function staleView() {
+  const raw = state.data.stale;
+  const items = raw.items || [];
+  if (state.deletedStale.size === 0) return { count: raw.count, items };
+  const kept = items.filter((i) => !state.deletedStale.has(staleDeviceId(i)));
+  return { count: Math.max(0, raw.count - (items.length - kept.length)), items: kept };
+}
+
 function render() {
   const trouble = troubleView();
+  const stale = staleView();
   setTabCount("count-updates", "updates", state.data.updates.count);
   setTabCount("count-trouble", "trouble", trouble.count);
-  setTabCount("count-stale", "stale", state.data.stale.count);
+  setTabCount("count-stale", "stale", stale.count);
   // (1.3.0) Cleanup's sensor state is a running SUM of the per-endpoint
   // unused-image estimate, not an item count -- see sensor.py's
   // PortainerCleanupCoordinator. Still the right number for the tab
@@ -573,7 +606,7 @@ function render() {
   setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
 
   const totalCount =
-    state.data.updates.count + trouble.count + state.data.stale.count + state.data.cleanup.count;
+    state.data.updates.count + trouble.count + stale.count + state.data.cleanup.count;
   el("empty-state").hidden = totalCount !== 0;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.hidden = totalCount === 0 || panel.dataset.panel !== state.activeTab;
@@ -1249,7 +1282,7 @@ function renderTroubleRows() {
 function renderStaleRows() {
   const tbody = el("rows-stale");
   tbody.innerHTML = "";
-  const items = state.data.stale.items || [];
+  const items = staleView().items;
   if (items.length === 0) {
     tbody.appendChild(emptyRow(3, "No stale devices."));
     return;
@@ -1671,7 +1704,7 @@ function renderActionBar() {
 }
 
 function selectAll(category, checked) {
-  const items = state.data[category].items || [];
+  const items = category === "stale" ? staleView().items : state.data[category].items || [];
   if (checked) {
     for (const item of items) {
       if (category === "cleanup") {
@@ -2071,25 +2104,52 @@ function confirmDeleteSelected() {
   );
 }
 
-async function deleteStaleDevices(deviceIds) {
-  showToast(`Deleting ${deviceIds.length} device(s)…`);
+// One request per device, one at a time (like the Cleanup batch): a failure is
+// that device's own, and each row has its own state. Every row in the batch
+// shows "Deleting…" from the start and frees up as its own request finishes. A
+// device whose delete succeeded is hidden at once and stays hidden until the
+// server stops listing it (see staleView), so the list never flips back to
+// active Delete buttons for devices that are already gone. A failed device keeps
+// its tick, so it can be retried.
+async function postDeleteStale(deviceId) {
   try {
     const res = await fetch("/api/actions/delete-stale", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_ids: deviceIds }),
+      body: JSON.stringify({ device_ids: [deviceId] }),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const result = await res.json();
-    for (const id of deviceIds) state.selection.stale.delete(id);
-    if (result.errors && result.errors.length > 0) {
-      showToast(`Done with ${result.errors.length} error(s) — check backend logs`);
-    } else {
-      showToast(`Deleted ${deviceIds.length} device(s)`);
-    }
+    if (result.errors && result.errors.length > 0) throw new Error(result.errors[0].error || "delete failed");
+    return true;
   } catch (e) {
-    showToast("Delete failed — see console");
     console.error(e);
+    return false;
   }
+}
+
+async function deleteStaleDevices(deviceIds) {
+  const keyOf = (id) => `delete-stale:${id}`;
+  for (const id of deviceIds) state.pendingActions.add(keyOf(id));
+  render();
+  showToast(`Deleting ${deviceIds.length} device(s)…`);
+  let failed = 0;
+  for (const id of deviceIds) {
+    const ok = await postDeleteStale(id);
+    state.pendingActions.delete(keyOf(id));
+    if (ok) {
+      state.selection.stale.delete(id);
+      state.deletedStale.set(id, Date.now());
+    } else {
+      failed++;
+    }
+    render();
+  }
+  showToast(
+    failed === 0
+      ? `Deleted ${deviceIds.length} device(s)`
+      : `${failed} of ${deviceIds.length} delete(s) failed — see console`
+  );
   loadActionItems();
 }
 
