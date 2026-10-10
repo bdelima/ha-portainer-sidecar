@@ -69,8 +69,8 @@ const state = {
   // Portainer intervention, an endpoint reload, etc).
   stackRestartErrors: new Map(),
   // Outcome of the last install attempt per update entity, keyed by
-  // entity id: { kind: "installed" | "failed" | "timed_out" | "unknown",
-  // message, detail, needsStackRestart, at }. A row renders from this
+  // entity id: { kind: "installed" | "failed" | "timed_out" | "unknown" |
+  // "restarted", message, detail, needsStackRestart, at }. A row renders from this
   // (not just from pendingActions) so that when a job resolves the row
   // moves straight from "Installing..." to a visible result instead of
   // falling back to "Install" until the next fetch. See
@@ -504,7 +504,8 @@ const INSTALLED_HOLD_MS = 120000;
 //   - the update is no longer listed -> the outcome is confirmed (an
 //     installed row simply disappears; a failed row has nothing left to
 //     retry because the server no longer offers the update), or
-//   - an "Installed" row has been waiting longer than INSTALLED_HOLD_MS.
+//   - an "Installed" or "Restarted" row has been waiting longer than
+//     INSTALLED_HOLD_MS.
 // A failed / timed_out / unknown result otherwise stays until the user
 // retries it.
 function pruneInstallResults() {
@@ -513,7 +514,7 @@ function pruneInstallResults() {
   const now = Date.now();
   for (const [entityId, result] of [...state.installResults]) {
     if (!listed.has(entityId)) state.installResults.delete(entityId);
-    else if (result.kind === "installed" && now - result.at > INSTALLED_HOLD_MS) {
+    else if ((result.kind === "installed" || result.kind === "restarted") && now - result.at > INSTALLED_HOLD_MS) {
       state.installResults.delete(entityId);
     }
   }
@@ -839,6 +840,9 @@ function installResultStatus(result, indentClass) {
   }
   line.textContent = result.message;
   line.title = result.detail || result.message;
+  // This app restarting to apply its own update is the expected outcome, not
+  // a warning: plain muted text.
+  if (result.kind === "restarted") return line;
   line.style.fontWeight = "500";
   // A confirmed failure is red; a timeout or lost job is "outcome unknown",
   // which is a warning, not a verdict.
@@ -876,6 +880,9 @@ function renderUpdateChildRow(item, indentLevel) {
     installBtn.disabled = true;
   } else if (installResult && installResult.kind === "installed") {
     installBtn.textContent = "Installed";
+    installBtn.disabled = true;
+  } else if (installResult && installResult.kind === "restarted") {
+    installBtn.textContent = "Restarted";
     installBtn.disabled = true;
   } else if (installResult) {
     installBtn.textContent = "Retry";
@@ -1937,6 +1944,20 @@ function isHomeAssistantOwnUpdate(entityId) {
   return name === "homeassistant" || name === "home-assistant" || name === "home_assistant";
 }
 
+// This app's own update. Recreating the sidecar's container restarts the very
+// process that is tracking the install job, so the job is gone when the page
+// next asks about it (see installResultFromJob). Matched by container name
+// (ha-portainer-sidecar, as in the README's compose example) or by the update's
+// changelog repo, because the update item carries no image field.
+function isSidecarOwnUpdate(entityId) {
+  const item = (state.data.updates.items || []).find((i) => i.entity === entityId);
+  if (!item) return false;
+  if (String(item.changelog_repo || "").toLowerCase() === "bdelima/ha-portainer-sidecar") return true;
+  if (!item.name) return false;
+  const name = item.name.replace(/\s*\([^)]*\)\s*$/, "").trim().toLowerCase();
+  return name === "ha-portainer-sidecar" || name === "ha_portainer_sidecar" || name === "portainer-sidecar";
+}
+
 // Splits a batch into submission groups, in the order they must run:
 // everything else first (Portainer's own update last within it), then Home
 // Assistant. Empty groups are dropped.
@@ -1959,7 +1980,7 @@ function shortInstallError(err) {
   return text.length > 100 ? text.slice(0, 100) + "…" : text;
 }
 
-function installResultFromJob(job) {
+function installResultFromJob(job, entityId) {
   const at = Date.now();
   if (job.status === "succeeded") {
     return { kind: "installed", needsStackRestart: !!job.needs_stack_restart, at };
@@ -1969,6 +1990,17 @@ function installResultFromJob(job) {
       kind: "timed_out",
       message: "Timed out — outcome unknown, check before retrying",
       detail: job.error || "",
+      at,
+    };
+  }
+  if (job.status === "unknown" && isSidecarOwnUpdate(entityId)) {
+    // The job lives in this app's memory, and updating this app restarts it,
+    // so losing the job is what a sidecar update looks like from here. Not a
+    // problem and nothing to check.
+    return {
+      kind: "restarted",
+      message: "Restarted to apply its own update, so the install status was lost. That is expected; this row clears once Home Assistant sees the new version.",
+      detail: "",
       at,
     };
   }
@@ -1987,7 +2019,7 @@ function installResultFromJob(job) {
 // outcome lists so installUpdates can report one summary for the whole
 // batch (which may be several groups run back to back).
 async function runInstallGroup(entityIds) {
-  const outcome = { errors: [], timedOut: [], needsStackRestart: [], submitFailed: false };
+  const outcome = { errors: [], timedOut: [], needsStackRestart: [], selfRestarted: [], submitFailed: false };
 
   let jobIds;
   try {
@@ -2014,7 +2046,7 @@ async function runInstallGroup(entityIds) {
 
   // job_ids comes back in the same order entityIds was submitted in.
   const jobs = jobIds.map((jobId, i) => ({ jobId, entityId: entityIds[i], done: false }));
-  const { errors, timedOut, needsStackRestart } = outcome;
+  const { errors, timedOut, needsStackRestart, selfRestarted } = outcome;
   const deadline = Date.now() + INSTALL_POLL_MAX_MS;
 
   while (jobs.some((j) => !j.done) && Date.now() < deadline) {
@@ -2042,6 +2074,9 @@ async function runInstallGroup(entityIds) {
         if (s.needs_stack_restart) needsStackRestart.push(job.entityId);
       } else if (s.status === "timed_out") {
         timedOut.push(job.entityId);
+      } else if (isSidecarOwnUpdate(job.entityId) && s.status === "unknown") {
+        // Expected: see installResultFromJob. Not an error.
+        selfRestarted.push(job.entityId);
       } else {
         errors.push(job.entityId);
       }
@@ -2051,7 +2086,8 @@ async function runInstallGroup(entityIds) {
       // flip the row back to "Install" until the next poll. The fetch
       // right after is what lets an installed row drop out as soon as the
       // server stops listing it.
-      state.installResults.set(job.entityId, installResultFromJob(s));
+      const result = installResultFromJob(s, job.entityId);
+      state.installResults.set(job.entityId, result);
       state.pendingActions.delete(`install:${job.entityId}`);
       render();
       loadActionItems();
@@ -2089,6 +2125,7 @@ async function installUpdates(entityIds) {
   const errors = [];
   const timedOut = [];
   const needsStackRestart = [];
+  const selfRestarted = [];
   let submitFailed = false;
   for (const [n, group] of groups.entries()) {
     if (n > 0) {
@@ -2102,6 +2139,7 @@ async function installUpdates(entityIds) {
     errors.push(...outcome.errors);
     timedOut.push(...outcome.timedOut);
     needsStackRestart.push(...outcome.needsStackRestart);
+    selfRestarted.push(...outcome.selfRestarted);
     if (outcome.submitFailed) submitFailed = true;
   }
 
@@ -2116,6 +2154,12 @@ async function installUpdates(entityIds) {
     if (errors.length > 0) parts.push(`${errors.length} error(s)`);
     if (timedOut.length > 0) parts.push(`${timedOut.length} timed out`);
     showToast(`Done with ${parts.join(", ")} — check backend logs`);
+  } else if (selfRestarted.length > 0) {
+    showToast(
+      ordered.length > selfRestarted.length
+        ? `Installed ${ordered.length - selfRestarted.length} update(s); this app restarted to apply its own update, as expected`
+        : "This app restarted to apply its own update, as expected",
+    );
   } else if (needsStackRestart.length > 0) {
     // (1.3.0) No persistent banner -- a one-time toast pointing at the
     // Trouble tab, which is where the actual remediation now lives (see
