@@ -2362,7 +2362,10 @@ async function pruneImages(dangling, untilHours, deviceIds) {
     showToast("Prune failed — see console");
     console.error(e);
   }
-  loadActionItems();
+  // Awaited, so the row stays on "Pruning…" until the new numbers are in
+  // (runPending frees it after this returns) instead of flashing back to an
+  // active button with the old counts.
+  await loadActionItems();
 }
 
 async function pruneVolumes(deviceIds) {
@@ -2381,7 +2384,7 @@ async function pruneVolumes(deviceIds) {
     showToast("Prune failed — see console");
     console.error(e);
   }
-  loadActionItems();
+  await loadActionItems();
 }
 
 // ---- Cleanup batch (ticked rows -> one run) ----
@@ -2470,17 +2473,23 @@ async function runCleanupBatch() {
   let failed = 0;
   for (const s of steps) {
     const ok = await postCleanupStep(s);
-    state.pendingActions.delete(keyOf(s));
     if (ok) {
       state.selection.cleanup.delete(cleanupSelId(s.deviceId, s.action));
       if (s.action === "unused") state.selection.cleanup.delete(cleanupSelId(s.deviceId, "dangling"));
     } else {
       failed++;
     }
+    // Re-read the numbers BEFORE the row is freed. The request above returns
+    // once the integration's Cleanup numbers have caught up, so this read
+    // shows the result of this step. Freeing the row first (and re-reading only
+    // after the last step, as this used to) put every finished row back on an
+    // active Prune button with its old counts until the whole batch was done,
+    // which could be minutes.
+    await loadActionItems();
+    state.pendingActions.delete(keyOf(s));
     render();
   }
   showToast(failed === 0 ? `Prune requested: ${steps.length} item${steps.length === 1 ? "" : "s"}` : `${failed} of ${steps.length} failed — see console`);
-  loadActionItems();
 }
 
 let toastTimer = null;
