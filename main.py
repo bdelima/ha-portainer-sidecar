@@ -778,6 +778,222 @@ async def panel_opened() -> dict[str, bool]:
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------
+# Dashboard compatibility (the "Update dashboard" row on Needs Remediation)
+#
+# This app leans on the Portainer Maintenance integration in Home Assistant:
+# its services, the fields on its sensors, the behavior built on them. The
+# integration reports an API LEVEL (major.minor.patch, an attribute of
+# sensor.portainer_actions_url, next to `version`, the release Home Assistant
+# is running). It is not the release number: it only changes when something
+# this app relies on changes. REQUIRED_DASHBOARD_API_LEVEL is the lowest level
+# this app can work with -- raise it, in the same change, whenever this app
+# starts to rely on something newer in the integration.
+#
+# An integration that predates the attribute has none, which counts as too old.
+# While the running level is too low there is one extra Needs Remediation row,
+# built here (the integration cannot raise it: the old one does not know what
+# this app needs). It drives the fix through Home Assistant's own services:
+#   update.install on the integration's HACS update entity, then a confirmed
+#   homeassistant.restart. HACS downloads the new files but Home Assistant keeps
+#   running the old code until it restarts.
+# ---------------------------------------------------------------------
+REQUIRED_DASHBOARD_API_LEVEL = "1.0.0"
+DASHBOARD_INFO_ENTITY = "sensor.portainer_actions_url"
+DASHBOARD_REPO = "bdelima/ha-portainer-dashboard"
+# Normally found by looking for the HACS update entity of DASHBOARD_REPO; set
+# this (e.g. update.portainer_maintenance_update) to name it explicitly.
+DASHBOARD_UPDATE_ENTITY_OVERRIDE = (os.environ.get("DASHBOARD_UPDATE_ENTITY") or "").strip() or None
+_dashboard_update_entity: str | None = None
+
+
+def _parse_level(value: Any) -> tuple[int, int, int] | None:
+    """"1.2.3" -> (1, 2, 3); None for anything that is not major.minor.patch."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*v?(\d+)\.(\d+)\.(\d+)\s*", value)
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+
+
+def _norm_version(value: Any) -> str:
+    """A release number without whitespace or a leading "v", for comparing the
+    version HACS has installed with the one Home Assistant is running."""
+    return str(value or "").strip().lstrip("vV")
+
+
+async def _ha_state_or_none(entity_id: str) -> dict[str, Any] | None:
+    """The entity's state, or None when Home Assistant does not have it (404).
+    Unlike ha_get_state, which fakes an empty sensor for a missing one."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{HA_BASE_URL}/api/states/{entity_id}", headers=HEADERS)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def _find_dashboard_update_entity() -> str | None:
+    """The HACS update entity of the dashboard integration. HACS gives each
+    repository it manages an update.* entity whose release_url points at the
+    repository (and, for an integration, whose picture is the integration's
+    brand icon), so that is what is looked for. Only searched for while a row
+    is needed; the answer is remembered until the entity goes missing."""
+    global _dashboard_update_entity
+    if DASHBOARD_UPDATE_ENTITY_OVERRIDE:
+        return DASHBOARD_UPDATE_ENTITY_OVERRIDE
+    if _dashboard_update_entity:
+        if await _ha_state_or_none(_dashboard_update_entity) is not None:
+            return _dashboard_update_entity
+        _dashboard_update_entity = None
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(f"{HA_BASE_URL}/api/states", headers=HEADERS)
+        resp.raise_for_status()
+        for entry in resp.json():
+            entity_id = str(entry.get("entity_id", ""))
+            if not entity_id.startswith("update."):
+                continue
+            attrs = entry.get("attributes") or {}
+            release_url = str(attrs.get("release_url") or "").lower()
+            picture = str(attrs.get("entity_picture") or "").lower()
+            if f"github.com/{DASHBOARD_REPO}".lower() in release_url or "/_/portainer_maintenance/" in picture:
+                _dashboard_update_entity = entity_id
+                log.info("Found the dashboard integration's HACS update entity: %s", entity_id)
+                return entity_id
+    return None
+
+
+def _dashboard_row(phase: str, running_level: str | None, running_version: str | None, installed: str,
+                   latest: str, entity: str | None) -> dict[str, Any]:
+    """The Needs Remediation row for an integration that is too old. `phase`
+    says where things stand and `action` which button (if any) the row gets:
+    "update" (download it through HACS) or "restart" (Home Assistant restart)."""
+    required = REQUIRED_DASHBOARD_API_LEVEL
+    reports = f"API level {running_level}" if running_level else "no API level (an older release)"
+    need = f"This sidecar needs the Portainer Maintenance integration at API level {required} or later; the one running in Home Assistant reports {reports}."
+    if phase == "update_available":
+        secondary = f"Version {latest} is available in HACS. Update it, then restart Home Assistant."
+        action = "update"
+    elif phase == "installing":
+        secondary = "Downloading the new version through HACS…"
+        action = None
+    elif phase == "restart_needed":
+        secondary = f"Version {installed} is downloaded. Restart Home Assistant to finish."
+        action = "restart"
+    elif phase == "restart_or_unpublished":
+        secondary = ("If you have already updated the integration in HACS, restart Home Assistant to finish. "
+                     "Otherwise a newer integration release is needed.")
+        action = "restart"
+    elif phase == "no_release":
+        secondary = f"HACS has no newer release of the integration (running {running_version}). A new release is needed."
+        action = None
+    else:  # no_hacs
+        secondary = "The integration's HACS update entity was not found. Update it in HACS (or by hand) and restart Home Assistant."
+        action = None
+    detail = (
+        f"{need} Until it is updated, some actions here may fail or be missing. "
+        "Updating this sidecar is always safe on its own; it is the integration that has to catch up. "
+        "Two steps: Update dashboard downloads the new integration through HACS, then Restart HA "
+        "(it asks first) restarts Home Assistant, because HACS only downloads the files and Home "
+        "Assistant keeps running the old code until it restarts. This row goes away once Home "
+        "Assistant is running an integration that reports the needed API level."
+    )
+    return {
+        "kind": "dashboard_update",
+        "name": "Dashboard integration needs an update",
+        "secondary_info": secondary,
+        "detail": detail,
+        "phase": phase,
+        "action": action,
+        "update_entity": entity,
+        "required_api_level": required,
+        "running_api_level": running_level,
+        "running_version": running_version,
+        "installed_version": installed or None,
+        "latest_version": latest or None,
+    }
+
+
+async def dashboard_compat() -> dict[str, Any] | None:
+    """None when the running integration meets REQUIRED_DASHBOARD_API_LEVEL
+    (or is not reporting yet), otherwise the row to show. Best effort: a Home
+    Assistant that cannot be asked gives None rather than a false row."""
+    info = await _ha_state_or_none(DASHBOARD_INFO_ENTITY)
+    if info is None or str(info.get("state")) in ("unavailable", "unknown"):
+        # Not there yet (Home Assistant is still starting): nothing to judge.
+        return None
+    attrs = info.get("attributes") or {}
+    required = _parse_level(REQUIRED_DASHBOARD_API_LEVEL)
+    running = _parse_level(attrs.get("api_level"))
+    if required is not None and running is not None and running >= required:
+        return None
+    running_level = attrs.get("api_level") if running is not None else None
+    running_version = _norm_version(attrs.get("version")) or None
+
+    entity = await _find_dashboard_update_entity()
+    hacs = await _ha_state_or_none(entity) if entity else None
+    if hacs is None or str(hacs.get("state")) in ("unavailable", "unknown"):
+        return _dashboard_row("no_hacs", running_level, running_version, "", "", entity)
+    hattrs = hacs.get("attributes") or {}
+    installed = _norm_version(hattrs.get("installed_version"))
+    latest = _norm_version(hattrs.get("latest_version"))
+    if hattrs.get("in_progress"):
+        phase = "installing"
+    elif str(hacs.get("state")) == "on":
+        phase = "update_available"
+    elif running_version:
+        # The integration reports its running release: downloaded but not yet
+        # running is exactly "HACS has a different version than Home
+        # Assistant runs".
+        phase = "restart_needed" if running_version != installed else "no_release"
+    else:
+        # An integration too old to report its release: "downloaded, restart
+        # pending" cannot be told apart from "no newer release", so offer the
+        # restart with text that covers both.
+        phase = "restart_or_unpublished"
+    return _dashboard_row(phase, running_level, running_version, installed, latest, entity)
+
+
+@app.post("/api/actions/update-dashboard")
+async def update_dashboard() -> dict[str, Any]:
+    """Downloads the newer dashboard integration through HACS (update.install
+    on its HACS update entity). Home Assistant keeps running the old code until
+    it restarts. Refused unless the row is currently offering this."""
+    started = time.monotonic()
+    row = await dashboard_compat()
+    if row is None or row["action"] != "update" or not row["update_entity"]:
+        raise HTTPException(status_code=409, detail="The dashboard integration does not need downloading right now")
+    entity = row["update_entity"]
+    detail = _q(entity)
+    try:
+        await ha_call_service("update", "install", {"entity_id": entity}, timeout=180)
+        _action_ok("update_dashboard", detail, started, f": {_q(row['latest_version'])}")
+    except httpx.HTTPError as exc:
+        _action_failed("update_dashboard", detail, exc, started)
+        raise HTTPException(status_code=502, detail=f"update failed: {_ha_error_message(exc)}") from exc
+    return {"ok": True}
+
+
+@app.post("/api/actions/restart-ha")
+async def restart_home_assistant() -> dict[str, Any]:
+    """Restarts Home Assistant so it runs the downloaded dashboard integration.
+    Refused unless the row is currently offering exactly that. Home Assistant
+    may drop the connection as it goes down, which is what a restart looks like
+    from here and is not a failure; a call that never connected is."""
+    started = time.monotonic()
+    row = await dashboard_compat()
+    if row is None or row["action"] != "restart":
+        raise HTTPException(status_code=409, detail="A restart is not needed right now")
+    try:
+        await ha_call_service("homeassistant", "restart", {}, timeout=30)
+        _action_ok("restart_ha", "'homeassistant.restart'", started)
+    except (httpx.ReadError, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.WriteError) as exc:
+        log_action.info("restart_ha ok: connection dropped as Home Assistant went down (%s)", _reason(exc))
+    except httpx.HTTPError as exc:
+        _action_failed("restart_ha", "'homeassistant.restart'", exc, started)
+        raise HTTPException(status_code=502, detail=f"restart failed: {_ha_error_message(exc)}") from exc
+    return {"ok": True}
+
+
 # True once a sensor read has worked, False after one has failed, None before
 # the first. The dashboard polls every 15 seconds per open tab, so a Home
 # Assistant outage would otherwise write a line every poll: only the change
@@ -809,6 +1025,15 @@ async def get_action_items() -> dict[str, Any]:
             count = 0
         items = state.get("attributes", {}).get("items", [])
         result[key] = {"count": count, "items": items}
+    try:
+        dashboard_row = await dashboard_compat()
+    except (httpx.HTTPError, ValueError) as exc:
+        # Never lets this extra check break the page.
+        log.debug("Dashboard compatibility check failed: %s", _reason(exc))
+        dashboard_row = None
+    if dashboard_row is not None:
+        result["trouble"]["items"] = [dashboard_row] + list(result["trouble"]["items"])
+        result["trouble"]["count"] += 1
     if _ha_reachable is False:
         log.info("Home Assistant is reachable again")
     _ha_reachable = True
