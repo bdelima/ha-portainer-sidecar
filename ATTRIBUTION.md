@@ -21,6 +21,7 @@ Installed from PyPI at image build time, unmodified; exact pins are in `requirem
 - **fastapi:** MIT
 - **uvicorn:** BSD-3-Clause
 - **httpx:** BSD-3-Clause
+- **websockets:** BSD-3-Clause
 
 ## Trademarks
 
