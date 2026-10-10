@@ -75,6 +75,11 @@ const state = {
   // the dashboard refreshes (their `refreshed_at` stamps) that showed the
   // disagreement. See imagePruneBlock / trackPruneConflicts.
   pruneConflict: new Map(),
+  // Stale Devices: device_id -> time it was deleted here, for devices whose
+  // delete succeeded but which the server may still list for a moment. They
+  // stay hidden until the server stops listing them. See deleteStaleDevices /
+  // staleView.
+  deletedStale: new Map(),
 };
 
 const el = (id) => document.getElementById(id);
@@ -442,6 +447,7 @@ async function loadActionItems() {
     state.data = await res.json();
     trackPruneConflicts();
     pruneDismissedTrouble();
+    pruneDeletedStale();
     pruneSelection();
     pruneStackRestartErrors();
     pruneInstallResults();
@@ -560,11 +566,38 @@ function troubleView() {
   return { count: Math.max(0, raw.count - (items.length - kept.length)), items: kept };
 }
 
+// How long a deleted Stale device stays hidden while the server still lists it.
+// Normally the next refresh stops listing it (the integration re-scans when a
+// device is removed); this cap only matters if it never does, so the row comes
+// back rather than staying hidden against what the server says.
+const DELETED_HOLD_MS = 120000;
+
+// Forget deleted devices the server has stopped listing, or has listed for
+// longer than DELETED_HOLD_MS. Run on fresh data, before it is displayed.
+function pruneDeletedStale() {
+  const listed = new Set((state.data.stale.items || []).map((i) => staleDeviceId(i)).filter(Boolean));
+  const now = Date.now();
+  for (const [id, at] of [...state.deletedStale]) {
+    if (!listed.has(id) || now - at > DELETED_HOLD_MS) state.deletedStale.delete(id);
+  }
+}
+
+// The Stale data as displayed: the server's list minus devices deleted here and
+// not yet confirmed gone, with the count adjusted to match.
+function staleView() {
+  const raw = state.data.stale;
+  const items = raw.items || [];
+  if (state.deletedStale.size === 0) return { count: raw.count, items };
+  const kept = items.filter((i) => !state.deletedStale.has(staleDeviceId(i)));
+  return { count: Math.max(0, raw.count - (items.length - kept.length)), items: kept };
+}
+
 function render() {
   const trouble = troubleView();
+  const stale = staleView();
   setTabCount("count-updates", "updates", state.data.updates.count);
   setTabCount("count-trouble", "trouble", trouble.count);
-  setTabCount("count-stale", "stale", state.data.stale.count);
+  setTabCount("count-stale", "stale", stale.count);
   // (1.3.0) Cleanup's sensor state is a running SUM of the per-endpoint
   // unused-image estimate, not an item count -- see sensor.py's
   // PortainerCleanupCoordinator. Still the right number for the tab
@@ -573,7 +606,7 @@ function render() {
   setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
 
   const totalCount =
-    state.data.updates.count + trouble.count + state.data.stale.count + state.data.cleanup.count;
+    state.data.updates.count + trouble.count + stale.count + state.data.cleanup.count;
   el("empty-state").hidden = totalCount !== 0;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.hidden = totalCount === 0 || panel.dataset.panel !== state.activeTab;
@@ -1249,7 +1282,7 @@ function renderTroubleRows() {
 function renderStaleRows() {
   const tbody = el("rows-stale");
   tbody.innerHTML = "";
-  const items = state.data.stale.items || [];
+  const items = staleView().items;
   if (items.length === 0) {
     tbody.appendChild(emptyRow(3, "No stale devices."));
     return;
@@ -1369,6 +1402,13 @@ const CLEANUP_ACTIONS = [
 
 // Whether the two image prunes are available for an endpoint. They are off
 // (and can't be ticked or batch-run) when `imagePruneBlock` says why:
+//   "computing"   the dashboard says this host's numbers are not ready yet
+//                 (`status: "computing"`: right after a restart its image
+//                 count, container count or reclaimable space has no usable
+//                 state yet). The numbers on the item are about to change.
+//   "unavailable" `status: "unavailable"`: the host was still not ready when
+//                 the dashboard's 5-minute backstop re-read ran. (Also, below,
+//                 `reclaimable_unavailable`.)
 //   "no-images"   `images_count` (every image on the endpoint, dangling ones
 //                 included) is 0.
 //   "unavailable" `reclaimable_unavailable`: the integration found core's
@@ -1391,8 +1431,18 @@ const CLEANUP_ACTIONS = [
 //                 dashboard only refreshes its Cleanup numbers every few
 //                 minutes, so it counts refreshes by their `refreshed_at`
 //                 stamp, not page polls.)
-// A dashboard integration too old to send these, or an unknown count, leaves
-// the rows enabled. Volumes are not affected: they are a separate prune.
+// A dashboard integration too old to send these (including `status`), or an
+// unknown count, leaves the rows enabled. Volumes are not affected: they are a
+// separate prune.
+//
+// `status` is the dashboard's own per-host verdict and wins over the rest: a
+// host that is computing or unavailable shows no numbers-based reason at all.
+// The "checking…" settling below is separate and sidecar-only: it covers two
+// numbers of a *ready* host that disagree.
+function hostNotReady(ep) {
+  return ep.status === "computing" || ep.status === "unavailable";
+}
+
 function imagePruneConflict(ep) {
   return (
     ep.images_count !== 0 &&
@@ -1405,6 +1455,8 @@ function imagePruneConflict(ep) {
 }
 
 function imagePruneBlock(ep) {
+  if (ep.status === "computing") return "computing";
+  if (ep.status === "unavailable") return "unavailable";
   if (ep.images_count === 0) return "no-images";
   if (ep.reclaimable_unavailable) return "unavailable";
   if (ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0)) return "nothing";
@@ -1423,7 +1475,7 @@ function imagePruneHasNothingToDo(ep) {
 function trackPruneConflicts() {
   const live = new Set();
   for (const ep of state.data.cleanup.items || []) {
-    if (!imagePruneConflict(ep)) continue;
+    if (hostNotReady(ep) || !imagePruneConflict(ep)) continue;
     const key = ep.device_id || ep.host;
     live.add(key);
     const rec = state.pruneConflict.get(key);
@@ -1535,7 +1587,8 @@ function renderCleanupRows() {
           // the "unused images" row's badge shows (not the number of
           // action rows, which is always the same). null (unknown upstream)
           // falls back to 0 rather than leaving the header blank.
-          count: ep.unused_estimate ?? 0,
+          // A host that is not ready counts 0, like the sensor does.
+          count: hostNotReady(ep) ? 0 : ep.unused_estimate ?? 0,
           indent: false,
           showCheckbox: true,
           checked: allTicked,
@@ -1561,14 +1614,16 @@ function renderCleanupRows() {
     const indent = !singleEndpoint;
     const noImages = ep.images_count === 0;
     const pruneBlock = imagePruneBlock(ep);
-    const pruneBlockBadge = { "no-images": "no images", nothing: "nothing to prune", unavailable: "status unavailable", settling: "checking…" }[pruneBlock] || null;
+    const pruneBlockBadge = { computing: "computing…", "no-images": "no images", nothing: "nothing to prune", unavailable: "status unavailable", settling: "checking…" }[pruneBlock] || null;
     const unusedBadge = ep.unused_estimate === null || ep.unused_estimate === undefined ? null : `~${ep.unused_estimate} unused`;
     const reclaimBadge = mibToCompactGb(ep.reclaimable_mib);
-    const unusedRowBadge = noImages
-      ? "no images"
-      : pruneBlock === "unavailable" || pruneBlock === "settling"
-        ? pruneBlockBadge
-        : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
+    const unusedRowBadge = hostNotReady(ep)
+      ? pruneBlockBadge
+      : noImages
+        ? "no images"
+        : pruneBlock === "unavailable" || pruneBlock === "settling"
+          ? pruneBlockBadge
+          : [unusedBadge, reclaimBadge].filter(Boolean).join(" · ") || null;
 
     // A running prune disables only the actions it conflicts with (the other
     // image prune), not the volume prune. See cleanupActionGroup.
@@ -1671,7 +1726,7 @@ function renderActionBar() {
 }
 
 function selectAll(category, checked) {
-  const items = state.data[category].items || [];
+  const items = category === "stale" ? staleView().items : state.data[category].items || [];
   if (checked) {
     for (const item of items) {
       if (category === "cleanup") {
@@ -2071,25 +2126,52 @@ function confirmDeleteSelected() {
   );
 }
 
-async function deleteStaleDevices(deviceIds) {
-  showToast(`Deleting ${deviceIds.length} device(s)…`);
+// One request per device, one at a time (like the Cleanup batch): a failure is
+// that device's own, and each row has its own state. Every row in the batch
+// shows "Deleting…" from the start and frees up as its own request finishes. A
+// device whose delete succeeded is hidden at once and stays hidden until the
+// server stops listing it (see staleView), so the list never flips back to
+// active Delete buttons for devices that are already gone. A failed device keeps
+// its tick, so it can be retried.
+async function postDeleteStale(deviceId) {
   try {
     const res = await fetch("/api/actions/delete-stale", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_ids: deviceIds }),
+      body: JSON.stringify({ device_ids: [deviceId] }),
     });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const result = await res.json();
-    for (const id of deviceIds) state.selection.stale.delete(id);
-    if (result.errors && result.errors.length > 0) {
-      showToast(`Done with ${result.errors.length} error(s) — check backend logs`);
-    } else {
-      showToast(`Deleted ${deviceIds.length} device(s)`);
-    }
+    if (result.errors && result.errors.length > 0) throw new Error(result.errors[0].error || "delete failed");
+    return true;
   } catch (e) {
-    showToast("Delete failed — see console");
     console.error(e);
+    return false;
   }
+}
+
+async function deleteStaleDevices(deviceIds) {
+  const keyOf = (id) => `delete-stale:${id}`;
+  for (const id of deviceIds) state.pendingActions.add(keyOf(id));
+  render();
+  showToast(`Deleting ${deviceIds.length} device(s)…`);
+  let failed = 0;
+  for (const id of deviceIds) {
+    const ok = await postDeleteStale(id);
+    state.pendingActions.delete(keyOf(id));
+    if (ok) {
+      state.selection.stale.delete(id);
+      state.deletedStale.set(id, Date.now());
+    } else {
+      failed++;
+    }
+    render();
+  }
+  showToast(
+    failed === 0
+      ? `Deleted ${deviceIds.length} device(s)`
+      : `${failed} of ${deviceIds.length} delete(s) failed — see console`
+  );
   loadActionItems();
 }
 
