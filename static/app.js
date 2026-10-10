@@ -494,27 +494,38 @@ function staleDeviceId(item) {
 }
 
 // How long an "Installed" row is held while the server data still lists
-// the update. Normally the very next fetch no longer lists it (the
-// integration hides an update as soon as perform_update succeeds); this cap
+// the update. Core's update entity can take several minutes to settle after a
+// recreate (it goes on -> unknown -> off), and until it does the integration
+// still lists the update; releasing the row earlier offered Install again for
+// an update that had already been applied. Seven minutes matches how long the
+// integration keeps an update listed as `confirming` (see below). The cap
 // only matters if the server keeps listing it, so the row falls back to
 // what the server says rather than claiming "Installed" forever.
-const INSTALLED_HOLD_MS = 120000;
+const INSTALLED_HOLD_MS = 420000;
 
 // Drop an install result once the server data has caught up with it:
 //   - the update is no longer listed -> the outcome is confirmed (an
 //     installed row simply disappears; a failed row has nothing left to
 //     retry because the server no longer offers the update), or
 //   - an "Installed" or "Restarted" row has been waiting longer than
-//     INSTALLED_HOLD_MS.
+//     INSTALLED_HOLD_MS, unless the integration still flags the update
+//     `confirming` (core's update entity is "unknown": the container is being
+//     recreated and core has not yet said whether it took), in which case the
+//     integration's own cap decides.
 // A failed / timed_out / unknown result otherwise stays until the user
 // retries it.
 function pruneInstallResults() {
   if (state.installResults.size === 0) return;
-  const listed = new Set((state.data.updates.items || []).map((i) => i.entity));
+  const listedItems = new Map((state.data.updates.items || []).map((i) => [i.entity, i]));
   const now = Date.now();
   for (const [entityId, result] of [...state.installResults]) {
-    if (!listed.has(entityId)) state.installResults.delete(entityId);
-    else if ((result.kind === "installed" || result.kind === "restarted") && now - result.at > INSTALLED_HOLD_MS) {
+    const listed = listedItems.get(entityId);
+    if (!listed) state.installResults.delete(entityId);
+    else if (
+      (result.kind === "installed" || result.kind === "restarted") &&
+      !listed.confirming &&
+      now - result.at > INSTALLED_HOLD_MS
+    ) {
       state.installResults.delete(entityId);
     }
   }
@@ -825,11 +836,14 @@ function renderGroupHeaderRow({
 // install result, otherwise the outcome of the last attempt. It sits under the
 // name, indented with it (the same layout as the Needs Remediation and Stale
 // Devices rows), so the Status cell is left to the buttons.
-function installResultStatus(result, indentClass) {
+function installResultStatus(result, indentClass, confirming = false) {
   const line = document.createElement("div");
   line.className = `row-secondary ${indentClass}`;
   if (!result) {
-    line.textContent = "Update available";
+    // `confirming`: the integration lists the update only because core's
+    // update entity is "unknown" right after being "on", i.e. the container
+    // is being recreated (from here, or from Portainer's own UI).
+    line.textContent = confirming ? "Update applied — confirming…" : "Update available";
     return line;
   }
   if (result.kind === "installed") {
@@ -872,11 +886,21 @@ function renderUpdateChildRow(item, indentLevel) {
   actions.className = "row-actions";
   const installKey = `install:${item.entity}`;
   const installPending = isPending(installKey);
-  const installResult = installPending ? null : state.installResults.get(item.entity) || null;
+  let installResult = installPending ? null : state.installResults.get(item.entity) || null;
+  // Core says the container is being recreated (see pruneInstallResults): a
+  // timed-out or lost job is no longer "outcome unknown", and with no result
+  // at all this was started somewhere else. Either way, don't offer Install
+  // again. A confirmed failure keeps its Retry.
+  const confirming =
+    !installPending && !!item.confirming && !(installResult && ["installed", "restarted", "failed"].includes(installResult.kind));
+  if (confirming) installResult = null;
   const installBtn = document.createElement("button");
   installBtn.className = "row-action-btn";
   if (installPending) {
     installBtn.textContent = "Installing…";
+    installBtn.disabled = true;
+  } else if (confirming) {
+    installBtn.textContent = "Confirming…";
     installBtn.disabled = true;
   } else if (installResult && installResult.kind === "installed") {
     installBtn.textContent = "Installed";
@@ -893,7 +917,7 @@ function renderUpdateChildRow(item, indentLevel) {
     state.installResults.delete(item.entity);
     runPending(installKey, () => installUpdates([item.entity]));
   });
-  descLine = installResultStatus(installResult, indentClass);
+  descLine = installResultStatus(installResult, indentClass, confirming);
   actions.appendChild(installBtn);
   if (item.changelog_repo) {
     // (1.3.8) Renders release notes in-app (see showChangelogDialog) --
@@ -2116,6 +2140,12 @@ async function runInstallGroup(entityIds) {
 }
 
 async function installUpdates(entityIds) {
+  // An update the integration flags `confirming` is already being applied:
+  // installing it again would recreate the container a second time.
+  const confirmingIds = new Set(
+    (state.data.updates.items || []).filter((i) => i.confirming).map((i) => i.entity)
+  );
+  entityIds = entityIds.filter((id) => !confirmingIds.has(id));
   if (entityIds.length === 0) return;
   const groups = installGroups(entityIds);
   const ordered = groups.flat();
@@ -2362,7 +2392,10 @@ async function pruneImages(dangling, untilHours, deviceIds) {
     showToast("Prune failed — see console");
     console.error(e);
   }
-  loadActionItems();
+  // Awaited, so the row stays on "Pruning…" until the new numbers are in
+  // (runPending frees it after this returns) instead of flashing back to an
+  // active button with the old counts.
+  await loadActionItems();
 }
 
 async function pruneVolumes(deviceIds) {
@@ -2381,7 +2414,7 @@ async function pruneVolumes(deviceIds) {
     showToast("Prune failed — see console");
     console.error(e);
   }
-  loadActionItems();
+  await loadActionItems();
 }
 
 // ---- Cleanup batch (ticked rows -> one run) ----
@@ -2470,17 +2503,23 @@ async function runCleanupBatch() {
   let failed = 0;
   for (const s of steps) {
     const ok = await postCleanupStep(s);
-    state.pendingActions.delete(keyOf(s));
     if (ok) {
       state.selection.cleanup.delete(cleanupSelId(s.deviceId, s.action));
       if (s.action === "unused") state.selection.cleanup.delete(cleanupSelId(s.deviceId, "dangling"));
     } else {
       failed++;
     }
+    // Re-read the numbers BEFORE the row is freed. The request above returns
+    // once the integration's Cleanup numbers have caught up, so this read
+    // shows the result of this step. Freeing the row first (and re-reading only
+    // after the last step, as this used to) put every finished row back on an
+    // active Prune button with its old counts until the whole batch was done,
+    // which could be minutes.
+    await loadActionItems();
+    state.pendingActions.delete(keyOf(s));
     render();
   }
   showToast(failed === 0 ? `Prune requested: ${steps.length} item${steps.length === 1 ? "" : "s"}` : `${failed} of ${steps.length} failed — see console`);
-  loadActionItems();
 }
 
 let toastTimer = null;
