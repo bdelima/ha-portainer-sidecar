@@ -799,7 +799,7 @@ async def panel_opened() -> dict[str, bool]:
 #   homeassistant.restart. HACS downloads the new files but Home Assistant keeps
 #   running the old code until it restarts.
 # ---------------------------------------------------------------------
-REQUIRED_DASHBOARD_API_LEVEL = "1.0.0"
+REQUIRED_DASHBOARD_API_LEVEL = "1.1.0"
 DASHBOARD_INFO_ENTITY = "sensor.portainer_actions_url"
 DASHBOARD_REPO = "bdelima/ha-portainer-dashboard"
 # Normally found by looking for the HACS update entity of DASHBOARD_REPO; set
@@ -1208,8 +1208,13 @@ async def get_action_items() -> dict[str, Any]:
             count = int(raw_state)
         except (TypeError, ValueError):
             count = 0
-        items = state.get("attributes", {}).get("items", [])
-        result[key] = {"count": count, "items": items}
+        attrs = state.get("attributes", {})
+        result[key] = {"count": count, "items": attrs.get("items", [])}
+        if key == "updates":
+            # Containers whose update went through but whose stack still needs
+            # a restart (dashboard integration api_level 1.1.0). Not part of
+            # `items` or the count: they are a restart to do, not an update.
+            result[key]["awaiting_restart"] = attrs.get("awaiting_restart", [])
     try:
         dashboard_row = await dashboard_compat()
     except (httpx.HTTPError, ValueError) as exc:

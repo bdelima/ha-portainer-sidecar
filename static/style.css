@@ -214,6 +214,8 @@ h1 {
 .row-name { font-weight: 500; overflow-wrap: anywhere; }
 .row-secondary { color: var(--muted); font-size: 0.8rem; margin-top: 2px; overflow-wrap: anywhere; }
 .row-secondary-failed { color: var(--danger); font-weight: 500; }
+/* A container that was updated and now waits for its stack to be restarted. */
+.row-secondary-awaiting { color: var(--warn); font-weight: 500; }
 /* Phone width: a little less horizontal padding in the tables, so the name
    column and the buttons both fit inside the panel. */
 @media (max-width: 480px) {
