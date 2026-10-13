@@ -64,8 +64,8 @@ const state = {
   // in the whole app where a silent failure is actively misleading (tap it,
   // assume the stack recovered, walk away). Keyed by switch_entity_id;
   // cleared on the next successful restart of that stack, or dropped by
-  // pruneStackRestartErrors() once that stack no longer shows a
-  // stack_restart_needed item at all (resolved some other way -- manual
+  // pruneStackRestartErrors() once that stack no longer has a container
+  // awaiting a restart (resolved some other way -- manual
   // Portainer intervention, an endpoint reload, etc).
   stackRestartErrors: new Map(),
   // Outcome of the last install attempt per update entity, keyed by
@@ -531,17 +531,23 @@ function pruneInstallResults() {
   }
 }
 
-// Drop a persistent restart error once its stack no longer has an open
-// stack_restart_needed item -- the underlying problem cleared some other
-// way (manual Portainer intervention, an endpoint reload bringing things
-// back cleanly, etc), so the stale error would otherwise sit there forever
-// with nothing to retry.
+// The containers whose update went through but whose stack still needs a
+// restart (the Updates sensor's `awaiting_restart`; an older integration
+// has none).
+function awaitingRestartItems() {
+  return (state.data.updates && state.data.updates.awaiting_restart) || [];
+}
+
+// Drop a persistent restart error once its stack no longer has a container
+// awaiting a restart -- the underlying problem cleared some other way
+// (manual Portainer intervention, an endpoint reload bringing things back
+// cleanly, etc), so the stale error would otherwise sit there forever with
+// nothing to retry.
 function pruneStackRestartErrors() {
   if (state.stackRestartErrors.size === 0) return;
   const stillNeedsRestart = new Set(
-    (state.data.trouble.items || [])
-      .filter((i) => i.kind === "stack_restart_needed")
-      .map((i) => i.stack_switch_entity_id || i.switch_entity_id)
+    awaitingRestartItems()
+      .map((i) => i.stack_switch_entity_id)
       .filter(Boolean)
   );
   for (const switchEntityId of [...state.stackRestartErrors.keys()]) {
@@ -629,8 +635,12 @@ function render() {
   // other three counts, just not len(items) under the hood.
   setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
 
+  // A container awaiting a stack restart is listed on the Updates tab but is
+  // not part of any count, so it has to keep the panels visible by itself:
+  // with nothing else pending, the tab would otherwise give way to the
+  // "all clear" state while a restart is still owed.
   const totalCount =
-    state.data.updates.count + trouble.count + stale.count + state.data.cleanup.count;
+    state.data.updates.count + trouble.count + stale.count + state.data.cleanup.count + awaitingRestartItems().length;
   el("empty-state").hidden = totalCount !== 0;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.hidden = totalCount === 0 || panel.dataset.panel !== state.activeTab;
@@ -715,34 +725,6 @@ function groupByStack(items) {
   }
   const stackList = [...stacks.values()].sort((a, b) => a.label.localeCompare(b.label));
   return { stacks: stackList, direct };
-}
-
-// (1.3.2) Stacks that currently have an open stack_restart_needed
-// Trouble item for the given endpoint, regardless of whether Updates
-// still has any pending item for them. Used to keep a stack's row on the
-// Updates tab visible -- with its warning badge but no children -- even
-// after every one of its containers has been installed, rather than the
-// stack (and the reminder that it still needs a manual restart) just
-// vanishing the moment nothing's left to select. Sourced from Trouble's
-// own item list rather than Updates', since once a stack's updates are
-// all installed, Updates has nothing left carrying that stack's identity
-// at all.
-function stacksAwaitingRestart(troubleItems, endpointKey) {
-  const map = new Map();
-  for (const item of troubleItems) {
-    if (item.kind !== "stack_restart_needed") continue;
-    if ((item.host_device_id || item.host) !== endpointKey) continue;
-    const key = item.stack_device_id || item.stack_name;
-    if (!map.has(key)) {
-      map.set(key, {
-        key,
-        label: item.stack_name,
-        switchEntityId: item.stack_switch_entity_id || item.switch_entity_id || null,
-        items: [],
-      });
-    }
-  }
-  return [...map.values()];
 }
 
 // A tree-header row (endpoint OR stack level) -- an expand/collapse
@@ -848,7 +830,7 @@ function installResultStatus(result, indentClass, confirming = false) {
   }
   if (result.kind === "installed") {
     line.textContent = result.needsStackRestart
-      ? "Installed — stack needs a restart, see the Needs Remediation tab"
+      ? "Installed — stack needs a restart"
       : "Installed — confirming…";
     return line;
   }
@@ -969,24 +951,74 @@ function renderUpdateChildRow(item, indentLevel) {
   return tr;
 }
 
+// A container that was updated but whose stack still needs a restart: not an
+// update to install, a restart to do, so no checkbox. It says why the restart
+// is suggested (the integration's `detail`), and has the stack restart on it.
+function renderAwaitingRestartRow(item, indentLevel) {
+  const tr = document.createElement("tr");
+  tr.className = "stack-child-row awaiting-restart-row";
+  const tdCheck = document.createElement("td");
+
+  const tdName = document.createElement("td");
+  const indentClass = indentLevel === 2 ? "row-name-indent-2" : indentLevel === 1 ? "row-name-indent" : "";
+  tdName.innerHTML = `<div class="row-name ${indentClass}">${escapeHtml(item.name)}</div>`;
+  const descLine = document.createElement("div");
+  descLine.className = `row-secondary ${indentClass}`;
+  const status = document.createElement("span");
+  status.className = "row-secondary-awaiting";
+  status.textContent = item.secondary_info || "Awaiting stack restart";
+  descLine.appendChild(status);
+  if (item.detail) descLine.appendChild(document.createTextNode(` — ${item.detail}`));
+
+  const tdStatus = document.createElement("td");
+  const actions = document.createElement("div");
+  actions.className = "row-actions";
+  const switchId = item.stack_switch_entity_id;
+  if (switchId) {
+    const key = `restart-stack:${switchId}`;
+    const pending = isPending(key);
+    const btn = document.createElement("button");
+    btn.className = "row-action-btn";
+    btn.textContent = pending ? "Restarting…" : "Restart Stack";
+    btn.disabled = pending;
+    btn.addEventListener("click", () => runPending(key, () => restartStack(switchId)));
+    actions.appendChild(btn);
+  }
+  tdStatus.appendChild(actions);
+
+  if (PHONE_MQ.matches) {
+    // Same two-row phone layout as an update row: the name across the top, the
+    // description with the button beside it.
+    tr.classList.add("update-row-title");
+    tdCheck.rowSpan = 2;
+    tdName.colSpan = 2;
+    tr.append(tdCheck, tdName);
+    const trDetail = document.createElement("tr");
+    trDetail.className = "stack-child-row update-row-detail awaiting-restart-row";
+    const tdDesc = document.createElement("td");
+    tdDesc.appendChild(descLine);
+    trDetail.append(tdDesc, tdStatus);
+    const pair = document.createDocumentFragment();
+    pair.append(tr, trDetail);
+    return pair;
+  }
+
+  tdName.appendChild(descLine);
+  tr.append(tdCheck, tdName, tdStatus);
+  return tr;
+}
+
 function renderUpdatesRows() {
   const tbody = el("rows-updates");
   tbody.innerHTML = "";
   const items = state.data.updates.items || [];
-  const troubleItems = state.data.trouble.items || [];
+  const awaiting = awaitingRestartItems();
 
-  // (1.3.2) Endpoints that have no pending updates left but still have a
-  // stack awaiting a manual restart need a row here too -- otherwise the
-  // household's only remaining "you still need to do something" signal for
-  // that host would live exclusively on the Trouble tab, and the endpoint
-  // would vanish from Updates entirely rather than staying visible with
-  // its phantom, childless stack. Collect every endpoint key that has
-  // either real update items or an awaiting-restart stack.
-  const endpointKeysWithUpdates = new Set(items.map((i) => i.host_device_id || i.host || "__unknown__"));
-  const endpointKeysAwaitingRestart = new Set(
-    troubleItems.filter((i) => i.kind === "stack_restart_needed").map((i) => i.host_device_id || i.host)
-  );
-  const allEndpointKeys = new Set([...endpointKeysWithUpdates, ...endpointKeysAwaitingRestart]);
+  // Containers awaiting a stack restart are listed under their stack as rows
+  // of their own, so an endpoint or stack that has nothing left to install but
+  // still owes a restart keeps its place in the tree instead of vanishing.
+  const keyOf = (i) => i.host_device_id || i.host || "__unknown__";
+  const allEndpointKeys = new Set([...items.map(keyOf), ...awaiting.map(keyOf)]);
 
   if (allEndpointKeys.size === 0) {
     tbody.appendChild(emptyRow(3, "No pending updates."));
@@ -994,13 +1026,9 @@ function renderUpdatesRows() {
   }
 
   const endpointGroups = groupByEndpoint(items);
-  // Add placeholder endpoint groups for hosts that have an awaiting-restart
-  // stack but zero real update items of their own (all installed already).
-  for (const key of endpointKeysAwaitingRestart) {
+  for (const key of allEndpointKeys) {
     if (!endpointGroups.some((g) => g.key === key)) {
-      const sample = troubleItems.find(
-        (i) => i.kind === "stack_restart_needed" && (i.host_device_id || i.host) === key
-      );
+      const sample = awaiting.find((i) => keyOf(i) === key);
       endpointGroups.push({ key, host: sample ? sample.host : "Unknown host", items: [] });
     }
   }
@@ -1010,16 +1038,18 @@ function renderUpdatesRows() {
   for (const ep of endpointGroups) {
     const epEntities = ep.items.map((i) => i.entity);
     const epExpanded = !state.collapsedEndpoints.has(`updates::${ep.key}`);
-    const phantomStacks = stacksAwaitingRestart(troubleItems, ep.key);
+    const epAwaiting = awaiting.filter((i) => keyOf(i) === ep.key);
 
     if (!singleEndpoint) {
+      // Nothing to select when the endpoint only owes restarts: no checkbox, no count.
+      const epSelectable = ep.items.length > 0;
       tbody.appendChild(
         renderGroupHeaderRow({
           label: ep.host,
-          count: ep.items.length,
+          count: epSelectable ? ep.items.length : null,
           indent: false,
-          showCheckbox: true,
-          checked: epEntities.every((id) => state.selection.updates.has(id)),
+          showCheckbox: epSelectable,
+          checked: epSelectable && epEntities.every((id) => state.selection.updates.has(id)),
           indeterminate:
             epEntities.some((id) => state.selection.updates.has(id)) &&
             !epEntities.every((id) => state.selection.updates.has(id)),
@@ -1044,35 +1074,35 @@ function renderUpdatesRows() {
     const { stacks, direct } = groupByStack(ep.items);
     const childIndent = singleEndpoint ? 1 : 2;
 
-    // (1.3.2) Merge in stacks that have no pending update items left but
-    // still have an open restart-needed Trouble entry -- these render as a
-    // childless row with a permanent badge rather than disappearing the
-    // moment their last update is installed. A stack that still has real
-    // update items handles its own badge via stack_has_open_trouble below,
-    // so it's excluded here to avoid a duplicate row.
-    const realStackKeys = new Set(stacks.map((s) => s.key));
-    const phantomOnly = phantomStacks.filter((s) => !realStackKeys.has(s.key));
-    const allStacks = [...stacks.map((s) => ({ ...s, phantom: false })), ...phantomOnly.map((s) => ({ ...s, phantom: true }))];
-    allStacks.sort((a, b) => a.label.localeCompare(b.label));
+    // Merge the awaiting-restart containers into their stacks. A stack that
+    // has only those has no installable items and no checkbox.
+    const merged = new Map(stacks.map((s) => [s.key, { ...s, awaiting: [] }]));
+    for (const s of groupByStack(epAwaiting).stacks) {
+      const m = merged.get(s.key) || { key: s.key, label: s.label, switchEntityId: s.switchEntityId, items: [], awaiting: [] };
+      m.awaiting = s.items;
+      if (!m.switchEntityId) m.switchEntityId = s.switchEntityId;
+      merged.set(s.key, m);
+    }
+    const allStacks = [...merged.values()].sort((a, b) => a.label.localeCompare(b.label));
 
     for (const stack of allStacks) {
       const stackKey = `updates::${ep.key}::${stack.key}`;
       const stackEntities = stack.items.map((i) => i.entity);
       const stackExpanded = !state.collapsedStacks.has(stackKey);
-      const hasOpenTrouble = stack.phantom || stack.items.some((i) => i.stack_has_open_trouble);
+      const selectable = stack.items.length > 0;
+      const owesRestart = stack.awaiting.length > 0 || stack.items.some((i) => i.stack_awaiting_restart);
 
       tbody.appendChild(
         renderGroupHeaderRow({
           label: stack.label,
-          // A phantom stack has nothing left to count -- "(0)" next to a
-          // "needs remediation" badge would read as "nothing's wrong here"
-          // right beside a warning saying otherwise, so it's omitted.
-          count: stack.phantom ? null : stack.items.length,
+          // A stack with nothing left to install has nothing to count -- "(0)"
+          // next to a warning badge would read as "nothing's wrong here".
+          count: selectable ? stack.items.length : null,
           indent: !singleEndpoint,
-          showCheckbox: !stack.phantom,
-          checked: !stack.phantom && stackEntities.every((id) => state.selection.updates.has(id)),
+          showCheckbox: selectable,
+          checked: selectable && stackEntities.every((id) => state.selection.updates.has(id)),
           indeterminate:
-            !stack.phantom &&
+            selectable &&
             stackEntities.some((id) => state.selection.updates.has(id)) &&
             !stackEntities.every((id) => state.selection.updates.has(id)),
           onToggleSelect: (checked) => {
@@ -1088,11 +1118,24 @@ function renderUpdatesRows() {
             else state.collapsedStacks.delete(stackKey);
             render();
           },
-          badgeHtml: hasOpenTrouble ? "⚠ See Needs Remediation tab" : null,
+          badgeHtml: owesRestart ? "⚠ Awaiting stack restart" : null,
+          actionButton:
+            stack.awaiting.length > 0 && stack.switchEntityId
+              ? {
+                  text: "Restart Stack Now",
+                  pendingText: "Restarting…",
+                  pending: isPending(`restart-stack:${stack.switchEntityId}`),
+                  onClick: () =>
+                    runPending(`restart-stack:${stack.switchEntityId}`, () => restartStack(stack.switchEntityId)),
+                }
+              : null,
         })
       );
-      if (!stackExpanded || stack.phantom) continue;
+      const restartError = stack.switchEntityId && state.stackRestartErrors.get(stack.switchEntityId);
+      if (restartError) tbody.appendChild(renderStackRestartErrorRow(restartError, !singleEndpoint, 3));
+      if (!stackExpanded) continue;
       for (const item of stack.items) tbody.appendChild(renderUpdateChildRow(item, childIndent));
+      for (const item of stack.awaiting) tbody.appendChild(renderAwaitingRestartRow(item, childIndent));
     }
 
     for (const item of direct) {
@@ -1114,11 +1157,11 @@ function renderUpdatesRows() {
 // genuinely needs to stay visible rather than auto-dismiss like a toast.
 // Cleared by pruneStackRestartErrors() once the stack no longer needs a
 // restart, or immediately on the next restart attempt (see restartStack).
-function renderStackRestartErrorRow(message, indent) {
+function renderStackRestartErrorRow(message, indent, cols = 2) {
   const tr = document.createElement("tr");
   tr.className = "stack-restart-error-row";
   const td = document.createElement("td");
-  td.colSpan = 2;
+  td.colSpan = cols;
   const indentClass = indent ? "row-name-indent" : "";
   td.innerHTML = `<div class="stack-restart-error ${indentClass}">Restart failed: ${escapeHtml(message)}</div>`;
   tr.appendChild(td);
@@ -2191,11 +2234,10 @@ async function installUpdates(entityIds) {
         : "This app restarted to apply its own update, as expected",
     );
   } else if (needsStackRestart.length > 0) {
-    // (1.3.0) No persistent banner -- a one-time toast pointing at the
-    // Trouble tab, which is where the actual remediation now lives (see
-    // renderTroubleRows above). Trouble picks this up on its own next
-    // poll without anything special needed here.
-    showToast(`Installed ${ordered.length} update(s) — a stack needs a restart, see the Needs Remediation tab`);
+    // (1.3.0) No persistent banner -- a one-time toast. The container is
+    // listed under its stack on this tab as awaiting a restart, which the
+    // next poll picks up without anything special needed here.
+    showToast(`Installed ${ordered.length} update(s) — a stack needs a restart, see Awaiting stack restart below`);
   } else {
     showToast(`Installed ${ordered.length} update(s)`);
   }
