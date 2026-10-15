@@ -538,6 +538,15 @@ function awaitingRestartItems() {
   return (state.data.updates && state.data.updates.awaiting_restart) || [];
 }
 
+// What clears an awaiting item: "reload_endpoint" (an update that never
+// settled in Home Assistant; restarting its stack did not clear it) or
+// "restart_stack" (the network_mode:service conflict). The integration sends it
+// as `remedy` (api_level 1.2.0); the reason is the fallback.
+function awaitingRemedy(item) {
+  if (item.remedy) return item.remedy;
+  return item.reason === "image_reference" ? "restart_stack" : "reload_endpoint";
+}
+
 // Drop a persistent restart error once its stack no longer has a container
 // awaiting a restart -- the underlying problem cleared some other way
 // (manual Portainer intervention, an endpoint reload bringing things back
@@ -547,6 +556,7 @@ function pruneStackRestartErrors() {
   if (state.stackRestartErrors.size === 0) return;
   const stillNeedsRestart = new Set(
     awaitingRestartItems()
+      .filter((i) => awaitingRemedy(i) === "restart_stack")
       .map((i) => i.stack_switch_entity_id)
       .filter(Boolean)
   );
@@ -818,6 +828,43 @@ function renderGroupHeaderRow({
 // install result, otherwise the outcome of the last attempt. It sits under the
 // name, indented with it (the same layout as the Needs Remediation and Stale
 // Devices rows), so the Status cell is left to the buttons.
+// How long the integration lets an update it applied stay "update available"
+// before it calls the container out of sync (its UPDATES_STUCK_WINDOW_SECONDS).
+// Only used to pace the progress bar on an "Installed" row.
+const STUCK_WINDOW_MS = 300000;
+
+// A small spinner, the message, and a thin progress bar under it, so a long
+// wait doesn't look frozen. `elapsedMs` is how long this app has been waiting
+// (null when it doesn't know, as when the update was started elsewhere); the
+// bar then slides instead of filling. A bar that has run its course also
+// slides, since the integration may take a moment to say what happens next.
+// Every render rebuilds the row from the clock, so the fill carries on where
+// it was rather than starting over.
+function waitingLine(line, message, elapsedMs) {
+  const spinner = document.createElement("span");
+  spinner.className = "row-spinner";
+  spinner.setAttribute("aria-hidden", "true");
+  line.append(spinner, document.createTextNode(message));
+  const bar = document.createElement("div");
+  bar.className = "row-progress";
+  bar.setAttribute("role", "progressbar");
+  bar.setAttribute("aria-busy", "true");
+  bar.setAttribute("aria-label", "Waiting for Home Assistant");
+  const fill = document.createElement("div");
+  fill.className = "row-progress-fill";
+  if (elapsedMs === null || elapsedMs >= STUCK_WINDOW_MS) {
+    fill.classList.add("indeterminate");
+  } else {
+    const from = Math.max(0, (elapsedMs / STUCK_WINDOW_MS) * 100);
+    fill.style.width = `${from.toFixed(1)}%`;
+    fill.style.setProperty("--from", `${from.toFixed(1)}%`);
+    fill.style.setProperty("--dur", `${Math.round(STUCK_WINDOW_MS - elapsedMs)}ms`);
+  }
+  bar.appendChild(fill);
+  line.appendChild(bar);
+  return line;
+}
+
 function installResultStatus(result, indentClass, confirming = false) {
   const line = document.createElement("div");
   line.className = `row-secondary ${indentClass}`;
@@ -825,14 +872,29 @@ function installResultStatus(result, indentClass, confirming = false) {
     // `confirming`: the integration lists the update only because core's
     // update entity is "unknown" right after being "on", i.e. the container
     // is being recreated (from here, or from Portainer's own UI).
-    line.textContent = confirming ? "Update applied — confirming…" : "Update available";
+    if (confirming) {
+      return waitingLine(
+        line,
+        "Update applied. Portainer is restarting the container and Home Assistant is waiting for it to report back, which can take a few minutes.",
+        null
+      );
+    }
+    line.textContent = "Update available";
     return line;
   }
   if (result.kind === "installed") {
-    line.textContent = result.needsStackRestart
-      ? "Installed — stack needs a restart"
-      : "Installed — confirming…";
-    return line;
+    if (result.needsStackRestart) {
+      line.textContent = "Installed — stack needs a restart";
+      return line;
+    }
+    const elapsed = Date.now() - result.at;
+    return waitingLine(
+      line,
+      elapsed < STUCK_WINDOW_MS
+        ? "Installed. Waiting for Home Assistant to confirm the new version, which can take up to 5 minutes."
+        : "Installed. Still waiting for Home Assistant. If it doesn't clear shortly, this row will say what to do.",
+      elapsed
+    );
   }
   line.textContent = result.message;
   line.title = result.detail || result.message;
@@ -951,9 +1013,10 @@ function renderUpdateChildRow(item, indentLevel) {
   return tr;
 }
 
-// A container that was updated but whose stack still needs a restart: not an
-// update to install, a restart to do, so no checkbox. It says why the restart
-// is suggested (the integration's `detail`), and has the stack restart on it.
+// A container that was updated but still needs a fix from you: not an update
+// to install, so no checkbox and a disabled "Installed" button. It says why
+// (the integration's `detail`). The fix itself is on the row it applies to: the
+// stack's for a restart, the endpoint's for a reload (see renderUpdatesRows).
 function renderAwaitingRestartRow(item, indentLevel) {
   const tr = document.createElement("tr");
   tr.className = "stack-child-row awaiting-restart-row";
@@ -966,24 +1029,20 @@ function renderAwaitingRestartRow(item, indentLevel) {
   descLine.className = `row-secondary ${indentClass}`;
   const status = document.createElement("span");
   status.className = "row-secondary-awaiting";
-  status.textContent = item.secondary_info || "Awaiting stack restart";
+  status.textContent =
+    item.secondary_info ||
+    (awaitingRemedy(item) === "reload_endpoint" ? "Awaiting endpoint reload" : "Awaiting stack restart");
   descLine.appendChild(status);
   if (item.detail) descLine.appendChild(document.createTextNode(` — ${item.detail}`));
 
   const tdStatus = document.createElement("td");
   const actions = document.createElement("div");
   actions.className = "row-actions";
-  const switchId = item.stack_switch_entity_id;
-  if (switchId) {
-    const key = `restart-stack:${switchId}`;
-    const pending = isPending(key);
-    const btn = document.createElement("button");
-    btn.className = "row-action-btn";
-    btn.textContent = pending ? "Restarting…" : "Restart Stack";
-    btn.disabled = pending;
-    btn.addEventListener("click", () => runPending(key, () => restartStack(switchId)));
-    actions.appendChild(btn);
-  }
+  const installedBtn = document.createElement("button");
+  installedBtn.className = "row-action-btn";
+  installedBtn.textContent = "Installed";
+  installedBtn.disabled = true;
+  actions.appendChild(installedBtn);
   tdStatus.appendChild(actions);
 
   if (PHONE_MQ.matches) {
@@ -1039,8 +1098,14 @@ function renderUpdatesRows() {
     const epEntities = ep.items.map((i) => i.entity);
     const epExpanded = !state.collapsedEndpoints.has(`updates::${ep.key}`);
     const epAwaiting = awaiting.filter((i) => keyOf(i) === ep.key);
+    // Containers that need the endpoint reloaded put that action, and a
+    // warning badge, on the endpoint's own row. With a single endpoint the
+    // row is normally left out, so it is shown while it has something to do.
+    const epReload = epAwaiting.filter((i) => awaitingRemedy(i) === "reload_endpoint");
+    const reloadDeviceId = (epReload.find((i) => i.host_device_id) || {}).host_device_id || null;
+    const showEpHeader = !singleEndpoint || epReload.length > 0;
 
-    if (!singleEndpoint) {
+    if (showEpHeader) {
       // Nothing to select when the endpoint only owes restarts: no checkbox, no count.
       const epSelectable = ep.items.length > 0;
       tbody.appendChild(
@@ -1066,13 +1131,24 @@ function renderUpdatesRows() {
             else state.collapsedEndpoints.delete(`updates::${ep.key}`);
             render();
           },
+          badgeHtml: epReload.length > 0 ? "⚠ Awaiting endpoint reload" : null,
+          actionButton:
+            epReload.length > 0 && reloadDeviceId
+              ? {
+                  text: "Reload Endpoint",
+                  pendingText: "Reloading…",
+                  pending: isPending(`reload-endpoint:${reloadDeviceId}`),
+                  onClick: () =>
+                    runPending(`reload-endpoint:${reloadDeviceId}`, () => reloadEndpoint(reloadDeviceId)),
+                }
+              : null,
         })
       );
       if (!epExpanded) continue;
     }
 
     const { stacks, direct } = groupByStack(ep.items);
-    const childIndent = singleEndpoint ? 1 : 2;
+    const childIndent = showEpHeader ? 2 : 1;
 
     // Merge the awaiting-restart containers into their stacks. A stack that
     // has only those has no installable items and no checkbox.
@@ -1090,7 +1166,8 @@ function renderUpdatesRows() {
       const stackEntities = stack.items.map((i) => i.entity);
       const stackExpanded = !state.collapsedStacks.has(stackKey);
       const selectable = stack.items.length > 0;
-      const owesRestart = stack.awaiting.length > 0 || stack.items.some((i) => i.stack_awaiting_restart);
+      const stackRestart = stack.awaiting.filter((i) => awaitingRemedy(i) === "restart_stack");
+      const owesRestart = stackRestart.length > 0 || stack.items.some((i) => i.stack_awaiting_restart);
 
       tbody.appendChild(
         renderGroupHeaderRow({
@@ -1098,7 +1175,7 @@ function renderUpdatesRows() {
           // A stack with nothing left to install has nothing to count -- "(0)"
           // next to a warning badge would read as "nothing's wrong here".
           count: selectable ? stack.items.length : null,
-          indent: !singleEndpoint,
+          indent: showEpHeader,
           showCheckbox: selectable,
           checked: selectable && stackEntities.every((id) => state.selection.updates.has(id)),
           indeterminate:
@@ -1120,7 +1197,7 @@ function renderUpdatesRows() {
           },
           badgeHtml: owesRestart ? "⚠ Awaiting stack restart" : null,
           actionButton:
-            stack.awaiting.length > 0 && stack.switchEntityId
+            stackRestart.length > 0 && stack.switchEntityId
               ? {
                   text: "Restart Stack Now",
                   pendingText: "Restarting…",
@@ -1132,14 +1209,14 @@ function renderUpdatesRows() {
         })
       );
       const restartError = stack.switchEntityId && state.stackRestartErrors.get(stack.switchEntityId);
-      if (restartError) tbody.appendChild(renderStackRestartErrorRow(restartError, !singleEndpoint, 3));
+      if (restartError) tbody.appendChild(renderStackRestartErrorRow(restartError, showEpHeader, 3));
       if (!stackExpanded) continue;
       for (const item of stack.items) tbody.appendChild(renderUpdateChildRow(item, childIndent));
       for (const item of stack.awaiting) tbody.appendChild(renderAwaitingRestartRow(item, childIndent));
     }
 
     for (const item of direct) {
-      tbody.appendChild(renderUpdateChildRow(item, singleEndpoint ? 0 : 1));
+      tbody.appendChild(renderUpdateChildRow(item, showEpHeader ? 1 : 0));
     }
   }
 }

@@ -216,6 +216,44 @@ h1 {
 .row-secondary-failed { color: var(--danger); font-weight: 500; }
 /* A container that was updated and now waits for its stack to be restarted. */
 .row-secondary-awaiting { color: var(--warn); font-weight: 500; }
+/* The wait after an install: a small spinner before the message and a thin
+   progress bar under it, so a few minutes of the same text doesn't look stuck.
+   The fill runs from where the wait has got to (--from) to full over what is
+   left of it (--dur); it slides instead when the end isn't known. */
+.row-spinner {
+  display: inline-block;
+  width: 0.75em;
+  height: 0.75em;
+  margin-right: 0.5em;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  vertical-align: -1px;
+  animation: row-spin 0.9s linear infinite;
+}
+.row-progress {
+  height: 3px;
+  max-width: 260px;
+  margin-top: 6px;
+  border-radius: 2px;
+  background: var(--border);
+  overflow: hidden;
+}
+.row-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  animation: row-progress-fill var(--dur, 300000ms) linear forwards;
+}
+.row-progress-fill.indeterminate {
+  width: 35%;
+  animation: row-progress-slide 1.4s ease-in-out infinite;
+}
+@keyframes row-spin { to { transform: rotate(360deg); } }
+@keyframes row-progress-fill { from { width: var(--from, 0%); } to { width: 100%; } }
+@keyframes row-progress-slide { from { margin-left: -35%; } to { margin-left: 100%; } }
+@media (prefers-reduced-motion: reduce) {
+  .row-spinner, .row-progress-fill, .row-progress-fill.indeterminate { animation: none; }
+}
 /* Phone width: a little less horizontal padding in the tables, so the name
    column and the buttons both fit inside the panel. */
 @media (max-width: 480px) {
