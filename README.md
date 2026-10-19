@@ -90,7 +90,7 @@ If none of these find anything, the app fails to start with a clear error asking
 
 ## Running it
 
-A prebuilt, multi-arch (amd64/arm64) image is published to Docker Hub as
+A prebuilt amd64 image is published to Docker Hub as
 [`bdelima/ha-portainer-sidecar`](https://hub.docker.com/r/bdelima/ha-portainer-sidecar),
 tagged both with each release version (see `VERSION`) and `latest` --
 built and pushed automatically by this repo's own GitHub Actions workflow
