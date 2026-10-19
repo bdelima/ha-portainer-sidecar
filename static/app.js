@@ -532,8 +532,8 @@ function pruneInstallResults() {
 }
 
 // The containers whose update went through but whose stack still needs a
-// restart (the Updates sensor's `awaiting_restart`; an older integration
-// has none).
+// restart (the Updates sensor's `awaiting_restart`; an older integration has
+// none).
 function awaitingRestartItems() {
   return (state.data.updates && state.data.updates.awaiting_restart) || [];
 }
@@ -752,7 +752,7 @@ function renderGroupHeaderRow({
   expanded,
   onToggleExpand,
   badgeHtml,
-  actionButton, // { text, pendingText, pending, onClick } | null
+  actionButton, // { text, pendingText, pending, onClick, holdText? } | null -- holdText: shown disabled while the action is held back
 }) {
   const tr = document.createElement("tr");
   tr.className = "stack-row";
@@ -803,8 +803,15 @@ function renderGroupHeaderRow({
   if (actionButton) {
     const btn = document.createElement("button");
     btn.className = "row-action-btn";
-    btn.textContent = actionButton.pending ? actionButton.pendingText || actionButton.text : actionButton.text;
-    btn.disabled = !!actionButton.pending;
+    // holdText: the action exists but is not available yet (see the stack
+    // restart hold in renderUpdatesRows). A running action wins over it.
+    const held = !actionButton.pending && !!actionButton.holdText;
+    btn.textContent = actionButton.pending
+      ? actionButton.pendingText || actionButton.text
+      : held
+        ? actionButton.holdText
+        : actionButton.text;
+    btn.disabled = !!actionButton.pending || held;
     btn.style.marginLeft = "12px";
     btn.style.float = "none";
     btn.addEventListener("click", (ev) => {
@@ -1168,6 +1175,15 @@ function renderUpdatesRows() {
       const selectable = stack.items.length > 0;
       const stackRestart = stack.awaiting.filter((i) => awaitingRemedy(i) === "restart_stack");
       const owesRestart = stackRestart.length > 0 || stack.items.some((i) => i.stack_awaiting_restart);
+      // A restart bounces every container in the stack, so while this tab is
+      // still installing (or has queued) other updates in it, the button waits:
+      // restarting mid-batch would cut those installs off. Counted from the
+      // install keys runPending sets for the whole batch up front and clears as
+      // each job finishes, so it also covers updates in later groups that have
+      // not been submitted yet.
+      const installsLeft = [...stack.items, ...stack.awaiting].filter((i) =>
+        isPending(`install:${i.entity}`),
+      ).length;
 
       tbody.appendChild(
         renderGroupHeaderRow({
@@ -1201,6 +1217,7 @@ function renderUpdatesRows() {
               ? {
                   text: "Restart Stack Now",
                   pendingText: "Restarting…",
+                  holdText: installsLeft > 0 ? `Waiting for ${installsLeft} update(s)…` : null,
                   pending: isPending(`restart-stack:${stack.switchEntityId}`),
                   onClick: () =>
                     runPending(`restart-stack:${stack.switchEntityId}`, () => restartStack(stack.switchEntityId)),
