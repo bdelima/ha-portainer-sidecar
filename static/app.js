@@ -532,8 +532,8 @@ function pruneInstallResults() {
 }
 
 // The containers whose update went through but whose stack still needs a
-// restart (the Updates sensor's `awaiting_restart`; an older integration has
-// none).
+// restart (the Updates sensor's `awaiting_restart`; an older integration
+// has none).
 function awaitingRestartItems() {
   return (state.data.updates && state.data.updates.awaiting_restart) || [];
 }
