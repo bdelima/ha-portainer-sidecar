@@ -426,6 +426,7 @@ async function runPending(keys, fn) {
   } finally {
     for (const k of keyList) state.pendingActions.delete(k);
     render();
+    reloadIfStale();
   }
 }
 
@@ -444,6 +445,52 @@ function tabFromHash() {
   // already in a phone's tray or any other existing link.
   if (hash === "needs-remediation") return "trouble";
   return ["updates", "trouble", "stale", "cleanup"].includes(hash) ? hash : null;
+}
+
+// A page keeps running the app.js it was opened with. When the sidecar is updated
+// (from its own row on this tab, or from Portainer), the container is replaced but
+// an open tab is not: its polling only fetches data, so it would carry on with the
+// old code (and, for example, miss a fix to when Restart Stack Now is held back).
+// So the page remembers the version it was loaded from and asks /version (open
+// without a session, answered by the new container once it is up) on every refresh.
+// Once the version differs it reloads itself. A failed or "unknown" answer never
+// triggers it, so a restart in progress, or an image built without a version,
+// leaves the page alone.
+let loadedVersion = null;
+let versionChanged = null; // the newer version, once seen
+let reloading = false;
+
+async function fetchVersion() {
+  try {
+    const res = await fetch("/version", { cache: "no-store" });
+    if (!res.ok) return null;
+    const version = (await res.json()).version;
+    return typeof version === "string" && version && version !== "unknown" ? version : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function checkForNewVersion() {
+  const version = await fetchVersion();
+  if (!version) return;
+  if (loadedVersion === null) loadedVersion = version;
+  else if (version !== loadedVersion) versionChanged = version;
+}
+
+function reloadPage() {
+  location.reload();
+}
+
+// Reloading drops this tab's record of what it is doing (every "Installing..." and
+// "Restarting..." row is drawn from state.pendingActions), so it waits until none of
+// those is running. It is tried again after every refresh and when an action ends.
+function reloadIfStale() {
+  if (reloading || !versionChanged || state.pendingActions.size > 0) return;
+  const version = versionChanged;
+  reloading = true;
+  showToast(`Sidecar updated to ${version} — reloading…`);
+  setTimeout(reloadPage, 800);
 }
 
 async function loadConfig() {
@@ -474,6 +521,8 @@ async function loadActionItems() {
     pruneInstallResults();
     render();
     el("last-updated").textContent = "Updated " + new Date().toLocaleTimeString();
+    await checkForNewVersion();
+    reloadIfStale();
   } catch (e) {
     el("last-updated").textContent = "Refresh failed — will retry";
     if (state.haRestartingUntil > Date.now()) state.haSeenDown = true;
@@ -2750,6 +2799,8 @@ const initialTab = tabFromHash();
 if (initialTab) activateTab(initialTab);
 
 loadConfig();
+// Note which sidecar version this page came from before anything else can change it.
+checkForNewVersion();
 // Having the dashboard in front of the person counts as having read Home
 // Assistant's "Portainer is reporting ..." bell notification, so tell the
 // backend, which dismisses that one notification (and only that one; the
