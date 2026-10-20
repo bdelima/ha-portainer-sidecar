@@ -188,7 +188,7 @@ function wireExternalLink(anchor) {
 // falling back to the link-dialog): the top one showing, and the other
 // sitting hidden-in-plain-sight underneath until the first was dismissed.
 // Closing every OTHER dialog before showing a new one keeps this a strict
-// one-at-a-time UI regardless of which combination of clicks a given
+// one-at-a-time UI regardless of which combination of dialogs a given
 // sequence of clicks happens to trigger.
 const DIALOG_IDS = ["confirm-dialog", "info-dialog", "link-dialog", "changelog-dialog"];
 function hideAllDialogs() {
