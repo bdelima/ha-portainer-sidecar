@@ -400,6 +400,16 @@ function isPending(key) {
   return state.pendingActions.has(key);
 }
 
+// How many of these updates are still on their way in: being installed from
+// this tab (the `install:<entity>` keys runPending sets for the whole batch up
+// front and clears as each job finishes, so queued updates count too), or
+// flagged `confirming` by the integration (applied, waiting for Home Assistant
+// to confirm). Restart Stack Now and Reload Endpoint wait for this to reach 0,
+// because either one would bounce or re-read containers mid-install.
+function updatesInFlight(items) {
+  return items.filter((i) => isPending(`install:${i.entity}`) || !!i.confirming).length;
+}
+
 // Marks one or more keys pending, runs fn, then clears them -- always,
 // whether fn resolves or throws. Calls render() immediately on entry (so
 // the busy state shows up right away, not just on the next poll) and
@@ -752,7 +762,7 @@ function renderGroupHeaderRow({
   expanded,
   onToggleExpand,
   badgeHtml,
-  actionButton, // { text, pendingText, pending, onClick } | null
+  actionButton, // { text, pendingText, pending, onClick, holdText? } | null -- holdText: shown disabled while the action is held back
 }) {
   const tr = document.createElement("tr");
   tr.className = "stack-row";
@@ -803,8 +813,15 @@ function renderGroupHeaderRow({
   if (actionButton) {
     const btn = document.createElement("button");
     btn.className = "row-action-btn";
-    btn.textContent = actionButton.pending ? actionButton.pendingText || actionButton.text : actionButton.text;
-    btn.disabled = !!actionButton.pending;
+    // holdText: the action exists but is not available yet (see
+    // updatesInFlight). A running action wins over it.
+    const held = !actionButton.pending && !!actionButton.holdText;
+    btn.textContent = actionButton.pending
+      ? actionButton.pendingText || actionButton.text
+      : held
+        ? actionButton.holdText
+        : actionButton.text;
+    btn.disabled = !!actionButton.pending || held;
     btn.style.marginLeft = "12px";
     btn.style.float = "none";
     btn.addEventListener("click", (ev) => {
@@ -1104,6 +1121,10 @@ function renderUpdatesRows() {
     const epReload = epAwaiting.filter((i) => awaitingRemedy(i) === "reload_endpoint");
     const reloadDeviceId = (epReload.find((i) => i.host_device_id) || {}).host_device_id || null;
     const showEpHeader = !singleEndpoint || epReload.length > 0;
+    // Reloading the endpoint makes Portainer re-read every container on it, so
+    // like Restart Stack Now it waits while any update on this endpoint is
+    // still installing or confirming (see updatesInFlight).
+    const epInstallsLeft = updatesInFlight([...ep.items, ...epAwaiting]);
 
     if (showEpHeader) {
       // Nothing to select when the endpoint only owes restarts: no checkbox, no count.
@@ -1137,6 +1158,7 @@ function renderUpdatesRows() {
               ? {
                   text: "Reload Endpoint",
                   pendingText: "Reloading…",
+                  holdText: epInstallsLeft > 0 ? `Waiting for ${epInstallsLeft} update(s)…` : null,
                   pending: isPending(`reload-endpoint:${reloadDeviceId}`),
                   onClick: () =>
                     runPending(`reload-endpoint:${reloadDeviceId}`, () => reloadEndpoint(reloadDeviceId)),
@@ -1168,6 +1190,12 @@ function renderUpdatesRows() {
       const selectable = stack.items.length > 0;
       const stackRestart = stack.awaiting.filter((i) => awaitingRemedy(i) === "restart_stack");
       const owesRestart = stackRestart.length > 0 || stack.items.some((i) => i.stack_awaiting_restart);
+      // A restart bounces every container in the stack, so while this tab is
+      // still installing (or has queued) other updates in it, or one of them is
+      // still `confirming`, the button waits: restarting mid-batch would cut
+      // those installs off. See updatesInFlight; it also covers updates in
+      // later groups that have not been submitted yet.
+      const installsLeft = updatesInFlight([...stack.items, ...stack.awaiting]);
 
       tbody.appendChild(
         renderGroupHeaderRow({
@@ -1201,6 +1229,7 @@ function renderUpdatesRows() {
               ? {
                   text: "Restart Stack Now",
                   pendingText: "Restarting…",
+                  holdText: installsLeft > 0 ? `Waiting for ${installsLeft} update(s)…` : null,
                   pending: isPending(`restart-stack:${stack.switchEntityId}`),
                   onClick: () =>
                     runPending(`restart-stack:${stack.switchEntityId}`, () => restartStack(stack.switchEntityId)),
