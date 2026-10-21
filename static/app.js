@@ -81,6 +81,17 @@ const state = {
   // the dashboard refreshes (their `refreshed_at` stamps) that showed the
   // disagreement. See imagePruneBlock / trackPruneConflicts.
   pruneConflict: new Map(),
+  // Cleanup: actions running from this tab that change what an endpoint runs
+  // (an install, a stack restart, an endpoint reload). pending key -> the
+  // endpoint's device_id, for as long as the key is pending. While one is
+  // there the endpoint's Cleanup numbers are not usable (see
+  // endpointActionInFlight).
+  actionHosts: new Map(),
+  // Cleanup: endpoints whose action from this tab just ended, held until the
+  // dashboard has read the endpoint again: device_id -> { refreshedAt (its
+  // `refreshed_at` when the action ended, or null if not yet known), since }.
+  // See startCleanupSettle / trackCleanupSettle.
+  cleanupSettle: new Map(),
   // Stale Devices: device_id -> time it was deleted here, for devices whose
   // delete succeeded but which the server may still list for a moment. They
   // stay hidden until the server stops listing them. See deleteStaleDevices /
@@ -419,15 +430,33 @@ function updatesInFlight(items) {
 // between click and that first server round trip.
 async function runPending(keys, fn) {
   const keyList = Array.isArray(keys) ? keys : [keys];
-  for (const k of keyList) state.pendingActions.add(k);
+  for (const k of keyList) {
+    state.pendingActions.add(k);
+    // An install, stack restart or endpoint reload also takes its endpoint's
+    // Cleanup numbers out of use until it is over (see endpointActionInFlight).
+    const host = endpointForActionKey(k);
+    if (host) state.actionHosts.set(k, host);
+  }
+  pruneSelection();
   render();
   try {
     await fn();
   } finally {
-    for (const k of keyList) state.pendingActions.delete(k);
+    for (const k of keyList) clearPending(k);
     render();
     reloadIfStale();
   }
+}
+
+// Ends one pending action. For an install, stack restart or endpoint reload,
+// the endpoint goes on being held until the dashboard has read it again, which
+// is what startCleanupSettle does. Pass { settle: false } when the action never
+// started (nothing changed on the endpoint).
+function clearPending(key, { settle = true } = {}) {
+  state.pendingActions.delete(key);
+  const host = state.actionHosts.get(key);
+  state.actionHosts.delete(key);
+  if (host && settle) startCleanupSettle(host);
 }
 
 // Valid initial tab from the URL's #fragment, e.g. a stack-restart-needed
@@ -513,6 +542,7 @@ async function loadActionItems() {
       state.haRestartingUntil = 0;
       state.haSeenDown = false;
     }
+    trackCleanupSettle();
     trackPruneConflicts();
     pruneDismissedTrouble();
     pruneDeletedStale();
@@ -702,14 +732,15 @@ function render() {
   // PortainerCleanupCoordinator. Still the right number for the tab
   // badge: "how many unused images across every host," same idea as the
   // other three counts, just not len(items) under the hood.
-  setTabCount("count-cleanup", "cleanup", state.data.cleanup.count);
+  const cleanup = cleanupView();
+  setTabCount("count-cleanup", "cleanup", cleanup.count);
 
   // A container awaiting a stack restart is listed on the Updates tab but is
   // not part of any count, so it has to keep the panels visible by itself:
   // with nothing else pending, the tab would otherwise give way to the
   // "all clear" state while a restart is still owed.
   const totalCount =
-    state.data.updates.count + trouble.count + stale.count + state.data.cleanup.count + awaitingRestartItems().length;
+    state.data.updates.count + trouble.count + stale.count + cleanup.count + awaitingRestartItems().length;
   el("empty-state").hidden = totalCount !== 0;
   for (const panel of document.querySelectorAll(".panel")) {
     panel.hidden = totalCount === 0 || panel.dataset.panel !== state.activeTab;
@@ -1795,7 +1826,104 @@ const CLEANUP_ACTIONS = [
 // The "checking…" settling below is separate and sidecar-only: it covers two
 // numbers of a *ready* host that disagree.
 function hostNotReady(ep) {
-  return ep.status === "computing" || ep.status === "unavailable";
+  return ep.status === "computing" || ep.status === "unavailable" || endpointActionInFlight(ep);
+}
+
+// ---- Cleanup: an endpoint with an action in flight ---------------------------
+//
+// While an install, a stack restart or an endpoint reload is running on an
+// endpoint, its container count is short (a stack that is down, or an old
+// container removed before the new one exists), so every image looks unused
+// and the Cleanup tab would offer to prune images the stack is about to start
+// again. The dashboard holds such an endpoint at `status: "computing"` itself
+// (`in_flight: true`), whoever started the action. This is the same hold on
+// this side, so it starts the moment the button is clicked rather than when the
+// dashboard next reads, and so the tab count and the rows agree with it.
+//
+// An endpoint is in flight when:
+//   - an `install:`, `restart-stack:` or `reload-endpoint:` action started from
+//     this tab is pending for it (state.actionHosts), or
+//   - the integration flags one of its updates `confirming` (the container was
+//     recreated and Home Assistant has not confirmed it), or
+//   - an action from this tab ended on it and the dashboard has not read the
+//     endpoint again since (state.cleanupSettle).
+// It is shown as "computing…" like a host that has just restarted: the image
+// prunes are off (and any tick on them is dropped), and it counts 0. The
+// volume prune is not affected, as for a computing host.
+
+// The Cleanup endpoint (a device_id) a pending action key changes, or null.
+function endpointForActionKey(key) {
+  const sep = key.indexOf(":");
+  if (sep < 0) return null;
+  const kind = key.slice(0, sep);
+  const id = key.slice(sep + 1);
+  if (kind === "reload-endpoint") return id || null;
+  const updates = state.data.updates || {};
+  if (kind === "install") {
+    const item = (updates.items || []).find((i) => i.entity === id);
+    return (item && item.host_device_id) || null;
+  }
+  if (kind === "restart-stack") {
+    const lists = [updates.items, updates.awaiting_restart, (state.data.trouble || {}).items];
+    for (const list of lists) {
+      const item = (list || []).find((i) => i.stack_switch_entity_id === id && i.host_device_id);
+      if (item) return item.host_device_id;
+    }
+  }
+  return null;
+}
+
+function endpointActionInFlight(ep) {
+  const device = ep && ep.device_id;
+  if (!device) return false;
+  for (const host of state.actionHosts.values()) if (host === device) return true;
+  if (((state.data.updates || {}).items || []).some((i) => i.confirming && i.host_device_id === device)) return true;
+  return state.cleanupSettle.has(device);
+}
+
+function cleanupRefreshedAt(device) {
+  const ep = (state.data.cleanup.items || []).find((i) => i.device_id === device);
+  return ep ? ep.refreshed_at || null : null;
+}
+
+// How long an ended action's hold lasts if the dashboard never reads the
+// endpoint again. It re-reads every few minutes at the latest (its backstop is
+// 5 minutes), so this only matters if it does not.
+const CLEANUP_SETTLE_MAX_MS = 6 * 60 * 1000;
+
+function startCleanupSettle(device) {
+  state.cleanupSettle.set(device, { refreshedAt: cleanupRefreshedAt(device), since: Date.now() });
+}
+
+// Called after each fetch, before anything renders from the new data: ends the
+// hold on an endpoint once the dashboard has read it again (a different
+// `refreshed_at`) or it has lasted CLEANUP_SETTLE_MAX_MS or the endpoint is gone.
+function trackCleanupSettle() {
+  for (const [device, rec] of [...state.cleanupSettle]) {
+    const ep = (state.data.cleanup.items || []).find((i) => i.device_id === device);
+    if (!ep || Date.now() - rec.since > CLEANUP_SETTLE_MAX_MS) {
+      state.cleanupSettle.delete(device);
+    } else if (rec.refreshedAt === null) {
+      rec.refreshedAt = ep.refreshed_at || null;
+    } else if (ep.refreshed_at !== rec.refreshedAt) {
+      state.cleanupSettle.delete(device);
+    }
+  }
+}
+
+// The Cleanup data as displayed: the server's count minus what this tab holds
+// back. The server already leaves out the endpoints it reports as not ready;
+// the ones held only here (an action just started, its first dashboard read
+// not in yet) are taken off the count here.
+function cleanupView() {
+  const raw = state.data.cleanup;
+  const items = raw.items || [];
+  let held = 0;
+  for (const ep of items) {
+    if (ep.status === "computing" || ep.status === "unavailable") continue;
+    if (endpointActionInFlight(ep)) held += ep.unused_estimate || 0;
+  }
+  return { count: Math.max(0, (raw.count || 0) - held), items };
 }
 
 function imagePruneConflict(ep) {
@@ -1810,8 +1938,8 @@ function imagePruneConflict(ep) {
 }
 
 function imagePruneBlock(ep) {
-  if (ep.status === "computing") return "computing";
   if (ep.status === "unavailable") return "unavailable";
+  if (ep.status === "computing" || endpointActionInFlight(ep)) return "computing";
   if (ep.images_count === 0) return "no-images";
   if (ep.reclaimable_unavailable) return "unavailable";
   if (ep.unused_estimate === 0 && !(ep.reclaimable_mib > 0)) return "nothing";
@@ -2025,7 +2153,17 @@ function renderCleanupRows() {
           indent,
           checkbox: selId ? { checked: !unavailable && sel.has(selId), disabled: unavailable, onChange: (checked) => toggleSelection("cleanup", selId, checked) } : null,
           onClick: () => {
-            showConfirmDialog(spec.confirm, "Prune", () => runPending(pendingKey, spec.run));
+            showConfirmDialog(spec.confirm, "Prune", () => {
+              // The dialog may have been open while an action started on this
+              // endpoint: judge it by the data as it is now, not as it was.
+              const current = (state.data.cleanup.items || []).find((i) => i.device_id === ep.device_id) || ep;
+              if (cleanupActionDisabled(current, action.id)) {
+                showToast(`Not pruned — ${ep.host} is busy`);
+                render();
+                return;
+              }
+              runPending(pendingKey, spec.run);
+            });
           },
         })
       );
@@ -2259,7 +2397,7 @@ async function runInstallGroup(entityIds) {
     console.error(e);
     // Nothing was submitted, so these rows are not installing: clear their
     // busy state rather than leaving them stuck on "Installing…".
-    for (const id of entityIds) state.pendingActions.delete(`install:${id}`);
+    for (const id of entityIds) clearPending(`install:${id}`, { settle: false });
     render();
     loadActionItems();
     outcome.submitFailed = true;
@@ -2310,7 +2448,7 @@ async function runInstallGroup(entityIds) {
       // server stops listing it.
       const result = installResultFromJob(s, job.entityId);
       state.installResults.set(job.entityId, result);
-      state.pendingActions.delete(`install:${job.entityId}`);
+      clearPending(`install:${job.entityId}`);
       render();
       loadActionItems();
     }
@@ -2330,7 +2468,7 @@ async function runInstallGroup(entityIds) {
       detail: "",
       at: Date.now(),
     });
-    state.pendingActions.delete(`install:${job.entityId}`);
+    clearPending(`install:${job.entityId}`);
     timedOut.push(job.entityId);
   }
 
@@ -2698,7 +2836,18 @@ async function runCleanupBatch() {
   render();
   showToast(`Pruning ${steps.length} item${steps.length === 1 ? "" : "s"}…`);
   let failed = 0;
+  let skipped = 0;
   for (const s of steps) {
+    // An action may have started on this endpoint since the batch was
+    // confirmed, or while an earlier step ran: skip it rather than prune from
+    // numbers that are not usable. Its tick goes with the row (pruneSelection).
+    const current = (state.data.cleanup.items || []).find((i) => i.device_id === s.deviceId);
+    if (current && cleanupActionDisabled(current, s.action)) {
+      skipped++;
+      state.pendingActions.delete(keyOf(s));
+      render();
+      continue;
+    }
     const ok = await postCleanupStep(s);
     if (ok) {
       state.selection.cleanup.delete(cleanupSelId(s.deviceId, s.action));
@@ -2716,7 +2865,12 @@ async function runCleanupBatch() {
     state.pendingActions.delete(keyOf(s));
     render();
   }
-  showToast(failed === 0 ? `Prune requested: ${steps.length} item${steps.length === 1 ? "" : "s"}` : `${failed} of ${steps.length} failed — see console`);
+  const skippedText = skipped > 0 ? `${skipped} skipped (busy)` : "";
+  showToast(
+    failed === 0
+      ? `Prune requested: ${steps.length - skipped} item${steps.length - skipped === 1 ? "" : "s"}${skippedText ? ` — ${skippedText}` : ""}`
+      : `${failed} of ${steps.length} failed${skippedText ? `, ${skippedText}` : ""} — see console`
+  );
 }
 
 let toastTimer = null;
