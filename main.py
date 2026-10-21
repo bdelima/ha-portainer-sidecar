@@ -799,7 +799,7 @@ async def panel_opened() -> dict[str, bool]:
 #   homeassistant.restart. HACS downloads the new files but Home Assistant keeps
 #   running the old code until it restarts.
 # ---------------------------------------------------------------------
-REQUIRED_DASHBOARD_API_LEVEL = "1.2.0"
+REQUIRED_DASHBOARD_API_LEVEL = "1.3.0"
 DASHBOARD_INFO_ENTITY = "sensor.portainer_actions_url"
 DASHBOARD_REPO = "bdelima/ha-portainer-dashboard"
 # Normally found by looking for the HACS update entity of DASHBOARD_REPO; set
